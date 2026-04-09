@@ -16,7 +16,7 @@ redesigning the execution philosophy around GPU hardware.
 - 96 MB L2 cache, 128 KB L1 cache per SM
 - 228 KB shared memory per SM
 
-**Codebase:** 3,717 lines across 24 files (22 CUDA headers, 1 CUDA source, 1 test).
+**Codebase:** ~4,400 lines across 25 files (23 CUDA headers, 1 CUDA source, 1 test).
 
 ---
 
@@ -77,22 +77,36 @@ This proves the following subsystems are fully functional:
 
 | Metric | Value |
 |--------|-------|
-| Emulation rate | 1.1 MIPS |
-| GPU cycles per guest instruction | ~2,200 |
-| GPU utilization | ~0.005% (1 of 188 SMs, 1 of ~60K possible threads) |
+| Emulation rate (1 hart) | 2.3 MIPS |
+| Emulation rate (4 harts SMP) | 4.4 MIPS aggregate (scaling as secondaries boot) |
+| GPU cycles per guest instruction | ~1,050 |
+| GPU utilization (4 harts) | ~2% (4 of 188 SMs) |
 | Batch size | 50,000 instructions per kernel launch |
 | Kernel launch overhead | ~5-10 us per launch |
-| Boot progress in 120s | ~120M instructions, kernel reaches hrtimer init |
-| Time to clocksource switch | ~60s wall time (13.5s kernel time) |
+| Boot progress in 90s (4 harts) | ~230M instructions, kernel reaches SMP bringup |
+| SMP status | Secondary harts started via SBI HSM, executing init code |
+
+### SMP Boot Evidence
+
+```
+[    0.000000] SBI HSM extension detected
+[    0.000000] SLUB: CPUs=4, Nodes=1
+[    0.000000] rcu: RCU restricting CPUs from NR_CPUS=256 to nr_cpu_ids=4.
+[    4.476483] smp: Bringing up secondary CPUs ...
+[HSM] hart0 starting hart1 at 80001066
+[HSM] hart0 starting hart2 at 80001066
+[HSM] hart0 starting hart3 at 80001066
+```
 
 ### Comparison to Established Emulators
 
-| Emulator | MIPS (single hart) | Technique |
-|----------|-------|-----------|
-| QEMU TCG (x86 host) | 100-300 | JIT compilation to native x86 |
-| GLAE (GPU, serial) | 1.1 | Interpreted, single GPU thread |
-| GLAE (GPU, theoretical SMP) | ~200 aggregate | 188 interpreted harts in parallel |
-| GLAE (GPU, theoretical JIT+SMP) | ~2000+ aggregate | JIT + all SMs active |
+| Emulator | MIPS | Technique |
+|----------|------|-----------|
+| QEMU TCG (x86 host) | 100-300 per hart | JIT compilation to native x86 |
+| GLAE (1 hart, interpreted) | 2.3 | Serial GPU thread |
+| GLAE (4 harts, SMP) | 4.4 aggregate | 4 SMs active, scaling with boot |
+| GLAE (188 harts, projected) | ~430 aggregate | All SMs active |
+| GLAE (188 harts + JIT, projected) | ~2,000-9,000 | JIT + all SMs |
 
 ---
 
@@ -325,6 +339,9 @@ and continues.
 | `3768d9c` | Linux boots on GPU | Fixed misaligned memcpy, 8250 earlycon |
 | `f64672a` | Phase 2: Instruction cache | icache, UART batching, -O3 |
 | `953e0d4` | Phase 3: Warp launch | 32-thread warp, slimmed kernel |
+| `21cbb0b` | SMP infrastructure | Per-hart icache/CLINT/PLIC, HSM, IPI, N-cpu FDT |
+| `24ab97d` | Zba/Zbb/Zbs extensions | Bit manipulation ISA for modern kernels |
+| `(next)` | SMP boot verified | 4 harts booting, secondary CPUs starting, 4.4 MIPS |
 
 ---
 

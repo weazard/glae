@@ -54,8 +54,11 @@ __device__ void uart_write(HartState* hart, Uart* u, uint64_t offset, uint64_t v
         if (dlab) { u->divisor = (u->divisor & 0xFF00) | v; }
         else {
             ring_push(u->tx_ring, v);
-            if (hart->yield_reason == YIELD_NONE)
-                hart->yield_reason = YIELD_UART_TX;
+            // Only yield when ring is getting full — batch characters
+            if (ring_count(u->tx_ring) > RING_SIZE * 3 / 4) {
+                if (hart->yield_reason == YIELD_NONE)
+                    hart->yield_reason = YIELD_UART_TX;
+            }
         }
         break;
     case 1:

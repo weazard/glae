@@ -1,5 +1,5 @@
 NVCC     := nvcc
-NVFLAGS  := -arch=sm_90 -O2 -std=c++17 --expt-relaxed-constexpr -lineinfo
+NVFLAGS  := -arch=sm_90 -O3 -std=c++17 --expt-relaxed-constexpr -lineinfo --use_fast_math
 TARGET   := glae
 SRC      := src/main.cu
 

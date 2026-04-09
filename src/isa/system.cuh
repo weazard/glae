@@ -1,5 +1,6 @@
 #pragma once
 #include "../core/hart.cuh"
+#include "../core/icache.cuh"
 #include "../priv/trap.cuh"
 #include "../priv/csr.cuh"
 #include "../priv/sbi.cuh"
@@ -100,14 +101,18 @@ __device__ bool exec_system(HartState* hart, Machine* m, uint32_t insn, int insn
             take_trap(hart, EXC_ILLEGAL_INSN, hart->pc, insn);
             return true;
         }
-        // Flush TLB (could be targeted by rs1/rs2, but full flush is safe)
+        // Flush TLB and instruction cache
         uint64_t vaddr = hart->x[rs1(insn)];
         if (rs1(insn) == 0) {
             tlb_flush(hart->itlb);
             tlb_flush(hart->dtlb);
+            icache_flush();  // full icache flush
         } else {
             tlb_flush_addr(hart->itlb, vaddr >> 12);
             tlb_flush_addr(hart->dtlb, vaddr >> 12);
+            // Targeted icache invalidation: flush entries in the page
+            uint32_t base_idx = ((uint32_t)(vaddr >> 1)) & ICACHE_MASK;
+            g_icache[base_idx].valid = 0;
         }
         return false; // advance PC normally
     }

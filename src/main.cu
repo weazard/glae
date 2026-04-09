@@ -16,6 +16,7 @@
 #include "platform/debug.cuh"
 
 // Core
+#include "core/icache.cuh"
 #include "core/hart.cuh"
 
 // ISA (order matters for dependencies)
@@ -50,23 +51,28 @@
 // ============================================================
 // GPU Kernel — main execution loop
 // ============================================================
-#define BATCH_SIZE 10000
+#define BATCH_SIZE 50000
 
-__global__ void vcpu_run(HartState* hart, Machine* mach) {
+__global__ void __launch_bounds__(1, 1) vcpu_run(HartState* hart, Machine* mach) {
+    // Initialize instruction cache on first launch
+    if (!g_icache_initialized) {
+        icache_flush();
+        g_icache_initialized = true;
+    }
+
     hart->yield_reason = YIELD_NONE;
 
     for (int i = 0; i < BATCH_SIZE && hart->yield_reason == YIELD_NONE; i++) {
         // Check timer periodically
-        if ((i & 0xFF) == 0) {
+        if ((i & 0x1FF) == 0) {
             clint_tick(hart, mach->clint);
-            // Check stimecmp too
             if (hart->stimecmp != 0 && hart->get_mtime() >= hart->stimecmp)
                 hart->mip |= MIP_STIP;
             plic_update_ext(hart, mach->plic);
         }
 
         // Check interrupts
-        if ((i & 0x3F) == 0) {
+        if ((i & 0xFF) == 0) {
             if (hart->wfi) {
                 uint64_t pending = hart->mip & hart->mie;
                 if (pending) hart->wfi = 0;
@@ -75,23 +81,39 @@ __global__ void vcpu_run(HartState* hart, Machine* mach) {
             check_interrupts(hart);
         }
 
-        // Fetch
-        uint32_t raw = 0;
-        if (!mem_fetch(hart, mach, &raw)) continue;
-
-        // Decompress if needed
+        // Fetch with instruction cache
         uint32_t insn;
         int insn_len;
-        if ((raw & 3) != 3) {
-            insn = decompress_c((uint16_t)(raw & 0xFFFF));
-            insn_len = 2;
-            if (insn == 0) {
-                take_trap(hart, EXC_ILLEGAL_INSN, hart->pc, raw & 0xFFFF);
-                continue;
-            }
+        uint64_t pc = hart->pc;
+        uint32_t ic_idx = ((uint32_t)(pc >> 1)) & ICACHE_MASK;
+        ICacheEntry* ic = &g_icache[ic_idx];
+
+        if (ic->valid && ic->pc == pc) {
+            // Cache hit — skip DRAM fetch and decompression
+            insn = ic->insn;
+            insn_len = ic->len;
         } else {
-            insn = raw;
-            insn_len = 4;
+            // Cache miss — fetch from memory
+            uint32_t raw = 0;
+            if (!mem_fetch(hart, mach, &raw)) continue;
+
+            if ((raw & 3) != 3) {
+                insn = decompress_c((uint16_t)(raw & 0xFFFF));
+                insn_len = 2;
+                if (insn == 0) {
+                    take_trap(hart, EXC_ILLEGAL_INSN, hart->pc, raw & 0xFFFF);
+                    continue;
+                }
+            } else {
+                insn = raw;
+                insn_len = 4;
+            }
+
+            // Insert into cache
+            ic->pc = pc;
+            ic->insn = insn;
+            ic->len = (uint8_t)insn_len;
+            ic->valid = 1;
         }
 
         // Execute
@@ -219,7 +241,7 @@ int main(int argc, char** argv) {
     // Build and copy FDT
     uint8_t fdt_buf[8192];
     memset(fdt_buf, 0, sizeof(fdt_buf));
-    const char* bootargs = "earlycon=uart8250,mmio,0x10000000,115200 console=ttyS0";
+    const char* bootargs = "earlycon=uart8250,mmio,0x10000000,115200 console=ttyS0 norandmaps pnp.debug=0";
     int fdt_size = build_fdt(fdt_buf, DRAM_BASE, dram_size, bootargs);
 
     // Place DTB at end of DRAM minus 2MB (safe location)

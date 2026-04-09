@@ -1,5 +1,6 @@
 #pragma once
 #include "../core/hart.cuh"
+#include "../core/icache.cuh"
 
 // Forward declaration
 __device__ void take_trap(HartState* hart, uint64_t cause, uint64_t pc, uint64_t tval);
@@ -141,9 +142,10 @@ __device__ bool csr_write(HartState* hart, uint32_t addr, uint64_t val) {
         if (hart->priv == PRV_S && (hart->mstatus & MSTATUS_TVM))
             return false;
         hart->satp = val;
-        // Flush TLB on satp write
+        // Flush TLB and instruction cache on satp write
         tlb_flush(hart->itlb);
         tlb_flush(hart->dtlb);
+        icache_flush();
         return true;
     case CSR_STIMECMP:
         hart->stimecmp = val;

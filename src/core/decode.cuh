@@ -94,9 +94,11 @@ __device__ bool execute(HartState* hart, Machine* m, uint32_t insn, int insn_len
     }
 
     case OP_MISC_MEM:
-        // FENCE variants + CBO instructions
+        // CBO instructions
         if (try_exec_cbo(hart, m, insn)) return false;
-        return false;  // plain FENCE = NOP
+        // FENCE — ensure cross-SM memory visibility for SMP
+        __threadfence();
+        return false;
 
     case OP_SYSTEM:
         return exec_system(hart, m, insn, insn_len);

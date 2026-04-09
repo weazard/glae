@@ -79,6 +79,10 @@ vcpu_run(HartState* harts, Machine* mach) {
         tlb_flush(hart->itlb);
         tlb_flush(hart->dtlb);
         icache_flush();
+        DPRINTF("[HART%d] Started at pc=%llx a0=%llu a1=%llx\n",
+                hart_id, (unsigned long long)hart->pc,
+                (unsigned long long)hart->mhartid,
+                (unsigned long long)hart->hsm_start_arg);
     }
 
     hart->yield_reason = YIELD_NONE;

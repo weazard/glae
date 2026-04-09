@@ -5,7 +5,20 @@
 
 // ============================================================
 // A Extension — Atomics (LR/SC, AMO)
+//
+// SMP-safe: uses CUDA atomic intrinsics so operations are
+// coherent across GPU blocks (SMs). This is critical because
+// Linux uses AMO for spinlocks and inter-hart synchronization.
 // ============================================================
+
+// Helper: get a pointer into DRAM for atomic operations.
+// Returns nullptr if the address is not in DRAM (MMIO).
+__device__ void* dram_ptr(Machine* m, uint64_t paddr, int size) {
+    if (paddr >= DRAM_BASE && paddr + size <= DRAM_BASE + m->dram_size)
+        return m->dram + (paddr - DRAM_BASE);
+    return nullptr;
+}
+
 __device__ bool exec_amo(HartState* hart, Machine* m, uint32_t insn) {
     uint32_t d = rd(insn);
     uint32_t f = funct3(insn);
@@ -13,8 +26,8 @@ __device__ bool exec_amo(HartState* hart, Machine* m, uint32_t insn) {
     uint64_t addr = hart->x[rs1(insn)];
     uint64_t src = hart->x[rs2(insn)];
 
-    bool is_word = (f == 2);   // .W
-    bool is_dword = (f == 3);  // .D
+    bool is_word = (f == 2);
+    bool is_dword = (f == 3);
     if (!is_word && !is_dword) {
         take_trap(hart, EXC_ILLEGAL_INSN, hart->pc, insn);
         return true;
@@ -22,81 +35,122 @@ __device__ bool exec_amo(HartState* hart, Machine* m, uint32_t insn) {
 
     int size = is_word ? 4 : 8;
 
-    // LR
-    if (f5 == 0x02) {
-        uint64_t val = 0;
-        if (!mem_load(hart, m, addr, size, &val)) return true;
-        if (is_word) val = (int64_t)(int32_t)(uint32_t)val;
+    // Alignment check
+    if (addr & (size - 1)) {
+        take_trap(hart, EXC_STORE_MISALIGNED, hart->pc, addr);
+        return true;
+    }
 
-        // Set reservation
-        uint64_t paddr;
-        if (!translate(hart, m, addr, ACCESS_READ, &paddr)) return true;
+    // Translate virtual → physical
+    uint64_t paddr;
+    if (!translate(hart, m, addr, ACCESS_WRITE, &paddr)) return true;
+
+    void* ptr = dram_ptr(m, paddr, size);
+    if (!ptr) {
+        take_trap(hart, EXC_STORE_ACCESS_FAULT, hart->pc, addr);
+        return true;
+    }
+
+    // ---- LR (Load-Reserved) ----
+    if (f5 == 0x02) {
+        uint64_t val;
+        if (is_word) {
+            val = (int64_t)(int32_t)atomicAdd((uint32_t*)ptr, 0u); // atomic read
+        } else {
+            val = (int64_t)atomicAdd((unsigned long long*)ptr, 0ull);
+        }
         hart->reservation_addr = paddr;
         hart->reservation_valid = 1;
-
+        __threadfence(); // acquire semantics
         if (d != 0) hart->x[d] = val;
         return false;
     }
 
-    // SC
+    // ---- SC (Store-Conditional) ----
     if (f5 == 0x03) {
-        if (hart->reservation_valid) {
-            uint64_t paddr;
-            if (!translate(hart, m, addr, ACCESS_WRITE, &paddr)) return true;
-            if (paddr == hart->reservation_addr) {
-                // Success — store and return 0
-                if (!mem_store(hart, m, addr, size, src)) return true;
-                hart->reservation_valid = 0;
-                if (d != 0) hart->x[d] = 0;
-                return false;
+        if (hart->reservation_valid && paddr == hart->reservation_addr) {
+            // Attempt atomic store via CAS
+            if (is_word) {
+                uint32_t expected;
+                memcpy(&expected, ptr, 4);
+                uint32_t desired = (uint32_t)src;
+                uint32_t old = atomicCAS((uint32_t*)ptr, expected, desired);
+                if (old == expected) {
+                    // Success
+                    __threadfence(); // release semantics
+                    hart->reservation_valid = 0;
+                    if (d != 0) hart->x[d] = 0;
+                    return false;
+                }
+            } else {
+                unsigned long long expected;
+                memcpy(&expected, ptr, 8);
+                unsigned long long desired = (unsigned long long)src;
+                unsigned long long old = atomicCAS((unsigned long long*)ptr, expected, desired);
+                if (old == expected) {
+                    __threadfence();
+                    hart->reservation_valid = 0;
+                    if (d != 0) hart->x[d] = 0;
+                    return false;
+                }
             }
         }
-        // Failure — return 1
+        // Failure
         hart->reservation_valid = 0;
         if (d != 0) hart->x[d] = 1;
         return false;
     }
 
-    // AMO operations: load, compute, store
-    uint64_t old_val = 0;
-    if (!mem_load(hart, m, addr, size, &old_val)) return true;
-    uint64_t signed_old = is_word ? (int64_t)(int32_t)(uint32_t)old_val : old_val;
+    // ---- AMO (Atomic Read-Modify-Write) ----
+    uint64_t old_val;
 
-    uint64_t new_val;
-    switch (f5) {
-    case 0x01: new_val = src; break;           // AMOSWAP
-    case 0x00: new_val = old_val + src; break; // AMOADD
-    case 0x04: new_val = old_val ^ src; break; // AMOXOR
-    case 0x0C: new_val = old_val & src; break; // AMOAND
-    case 0x08: new_val = old_val | src; break; // AMOOR
-    case 0x10: // AMOMIN
-        if (is_word)
-            new_val = ((int32_t)(uint32_t)old_val < (int32_t)(uint32_t)src) ?
-                      old_val : src;
-        else
-            new_val = ((int64_t)old_val < (int64_t)src) ? old_val : src;
-        break;
-    case 0x14: // AMOMAX
-        if (is_word)
-            new_val = ((int32_t)(uint32_t)old_val > (int32_t)(uint32_t)src) ?
-                      old_val : src;
-        else
-            new_val = ((int64_t)old_val > (int64_t)src) ? old_val : src;
-        break;
-    case 0x18: // AMOMINU
-        new_val = (old_val < src) ? old_val : src;
-        break;
-    case 0x1C: // AMOMAXU
-        new_val = (old_val > src) ? old_val : src;
-        break;
-    default:
-        take_trap(hart, EXC_ILLEGAL_INSN, hart->pc, insn);
-        return true;
+    if (is_word) {
+        uint32_t* p = (uint32_t*)ptr;
+        uint32_t s = (uint32_t)src;
+        uint32_t old;
+
+        switch (f5) {
+        case 0x01: old = atomicExch(p, s); break;
+        case 0x00: old = atomicAdd(p, s); break;
+        case 0x04: old = atomicXor(p, s); break;
+        case 0x0C: old = atomicAnd(p, s); break;
+        case 0x08: old = atomicOr(p, s); break;
+        case 0x10: old = atomicMin((int*)p, (int)s); break;
+        case 0x14: old = atomicMax((int*)p, (int)s); break;
+        case 0x18: old = atomicMin(p, s); break;
+        case 0x1C: old = atomicMax(p, s); break;
+        default:
+            take_trap(hart, EXC_ILLEGAL_INSN, hart->pc, insn);
+            return true;
+        }
+        old_val = (int64_t)(int32_t)old; // sign-extend
+    } else {
+        unsigned long long* p = (unsigned long long*)ptr;
+        unsigned long long s = (unsigned long long)src;
+        unsigned long long old;
+
+        switch (f5) {
+        case 0x01: old = atomicExch(p, s); break;
+        case 0x00: old = atomicAdd(p, s); break;
+        case 0x04: old = atomicXor(p, s); break;
+        case 0x0C: old = atomicAnd(p, s); break;
+        case 0x08: old = atomicOr(p, s); break;
+        case 0x10: old = atomicMin((long long*)p, (long long)s); break;
+        case 0x14: old = atomicMax((long long*)p, (long long)s); break;
+        case 0x18: old = atomicMin(p, s); break;
+        case 0x1C: old = atomicMax(p, s); break;
+        default:
+            take_trap(hart, EXC_ILLEGAL_INSN, hart->pc, insn);
+            return true;
+        }
+        old_val = old;
     }
 
-    if (is_word) new_val = (uint32_t)new_val;
-    if (!mem_store(hart, m, addr, size, new_val)) return true;
+    // Memory fence for acquire/release
+    uint32_t aq = (insn >> 26) & 1;
+    uint32_t rl = (insn >> 25) & 1;
+    if (aq || rl) __threadfence();
 
-    if (d != 0) hart->x[d] = signed_old;
+    if (d != 0) hart->x[d] = old_val;
     return false;
 }

@@ -50,7 +50,7 @@
 // ============================================================
 // GPU Kernel — main execution loop
 // ============================================================
-#define BATCH_SIZE 50000
+#define BATCH_SIZE 10000
 
 __global__ void vcpu_run(HartState* hart, Machine* mach) {
     hart->yield_reason = YIELD_NONE;
@@ -219,7 +219,7 @@ int main(int argc, char** argv) {
     // Build and copy FDT
     uint8_t fdt_buf[8192];
     memset(fdt_buf, 0, sizeof(fdt_buf));
-    const char* bootargs = "earlycon=sbi console=ttyS0";
+    const char* bootargs = "earlycon=uart8250,mmio,0x10000000,115200 console=ttyS0";
     int fdt_size = build_fdt(fdt_buf, DRAM_BASE, dram_size, bootargs);
 
     // Place DTB at end of DRAM minus 2MB (safe location)
@@ -298,7 +298,11 @@ int main(int argc, char** argv) {
 
     while (running) {
         vcpu_run<<<1, 1>>>(d_hart, d_mach);
-        cudaDeviceSynchronize();
+        cudaError_t err = cudaDeviceSynchronize();
+        if (err != cudaSuccess) {
+            fprintf(stderr, "[GLAE] CUDA error: %s\n", cudaGetErrorString(err));
+            break;
+        }
         total_batches++;
 
         // Drain UART TX
@@ -319,6 +323,23 @@ int main(int argc, char** argv) {
         // Check yield reason
         uint32_t yield;
         cudaMemcpy(&yield, &d_hart->yield_reason, sizeof(uint32_t), cudaMemcpyDeviceToHost);
+
+        // Periodic progress report
+        if (debug && (total_batches % 2000 == 0)) {
+            uint64_t instret, pc;
+            uint8_t priv;
+            cudaMemcpy(&instret, &d_hart->instret, sizeof(uint64_t), cudaMemcpyDeviceToHost);
+            cudaMemcpy(&pc, &d_hart->pc, sizeof(uint64_t), cudaMemcpyDeviceToHost);
+            cudaMemcpy(&priv, &d_hart->priv, sizeof(uint8_t), cudaMemcpyDeviceToHost);
+            auto now = std::chrono::high_resolution_clock::now();
+            double elapsed = std::chrono::duration<double>(now - t_start).count();
+            fprintf(stderr, "[GLAE] batch=%llu insns=%llu pc=%llx priv=%d yield=%u MIPS=%.1f (%.1fs)\n",
+                    (unsigned long long)total_batches,
+                    (unsigned long long)instret,
+                    (unsigned long long)pc,
+                    priv, yield,
+                    instret / elapsed / 1e6, elapsed);
+        }
 
         switch (yield) {
         case YIELD_UART_TX:

@@ -29,8 +29,10 @@ __device__ bool handle_sbi(HartState* hart, Machine* m) {
     uint64_t fid = hart->x[16]; // a6
     uint64_t a0 = hart->x[10];
 
-    DPRINTF("[SBI] eid=0x%llx fid=0x%llx a0=0x%llx\n",
-            (unsigned long long)eid, (unsigned long long)fid, (unsigned long long)a0);
+    // Suppress timer spam in debug output
+    if (eid != SBI_EXT_TIMER && eid != SBI_LEGACY_SET_TIMER)
+        DPRINTF("[SBI] eid=0x%llx fid=0x%llx a0=0x%llx\n",
+                (unsigned long long)eid, (unsigned long long)fid, (unsigned long long)a0);
 
     int64_t err = SBI_SUCCESS;
     int64_t ret = 0;

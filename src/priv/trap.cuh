@@ -8,6 +8,7 @@ __device__ void take_trap(HartState* hart, uint64_t cause, uint64_t pc, uint64_t
     bool is_interrupt = (cause >> 63) & 1;
     uint64_t code = cause & ~CAUSE_INTERRUPT_BIT;
 
+
     // Determine target privilege: check delegation
     bool delegate = false;
     if (hart->priv <= PRV_S) {

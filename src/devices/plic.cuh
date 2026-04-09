@@ -2,15 +2,17 @@
 #include "../core/hart.cuh"
 
 #define PLIC_NUM_SRC   64
-#define PLIC_NUM_CTX   2   // 0=M-mode, 1=S-mode
+#define PLIC_NUM_CTX   (MAX_HARTS * 2)  // 2 contexts per hart (M-mode, S-mode)
 
 struct Plic {
-    uint32_t priority[PLIC_NUM_SRC + 1]; // source 0 unused
-    uint64_t pending;                     // bit per source
-    uint64_t enable[PLIC_NUM_CTX];       // per-context enable
+    uint32_t priority[PLIC_NUM_SRC + 1];
+    uint64_t pending;
+    uint64_t enable[PLIC_NUM_CTX];
     uint32_t threshold[PLIC_NUM_CTX];
     uint32_t claim[PLIC_NUM_CTX];
 };
+
+// For a given hart, S-mode context = hart*2+1, M-mode context = hart*2
 
 __device__ uint32_t plic_highest_pending(Plic* p, int ctx) {
     uint64_t candidates = p->pending & p->enable[ctx];

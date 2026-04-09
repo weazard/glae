@@ -2,10 +2,11 @@
 #include <cstdint>
 
 // ============================================================
-// Instruction Cache — avoids DRAM fetch for hot instruction loops
+// Per-hart instruction cache
+// Each hart (GPU block) gets its own icache slice.
 // ============================================================
-#define ICACHE_SIZE 2048
-#define ICACHE_MASK (ICACHE_SIZE - 1)
+#define ICACHE_ENTRIES 2048
+#define ICACHE_MASK (ICACHE_ENTRIES - 1)
 
 struct ICacheEntry {
     uint64_t pc;
@@ -14,11 +15,25 @@ struct ICacheEntry {
     uint8_t  valid;
 };
 
-// Global instruction cache (persists across kernel launches)
-static __device__ ICacheEntry g_icache[ICACHE_SIZE];
-static __device__ bool g_icache_initialized = false;
+// Per-hart icache array in global memory (allocated dynamically)
+// Indexed as: g_icache_pool[hart_id * ICACHE_ENTRIES + index]
+static __device__ ICacheEntry* g_icache_pool = nullptr;
+static __device__ int g_num_harts = 0;
+
+__device__ static ICacheEntry* hart_icache() {
+    return g_icache_pool + blockIdx.x * ICACHE_ENTRIES;
+}
 
 __device__ static void icache_flush() {
-    for (int i = 0; i < ICACHE_SIZE; i++)
-        g_icache[i].valid = 0;
+    ICacheEntry* ic = hart_icache();
+    for (int i = 0; i < ICACHE_ENTRIES; i++)
+        ic[i].valid = 0;
+}
+
+// Flush ALL harts' icaches (called from host via small kernel)
+__global__ static void icache_flush_all_kernel(ICacheEntry* pool, int num_harts) {
+    int tid = blockIdx.x * blockDim.x + threadIdx.x;
+    int total = num_harts * ICACHE_ENTRIES;
+    for (int i = tid; i < total; i += gridDim.x * blockDim.x)
+        pool[i].valid = 0;
 }

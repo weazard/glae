@@ -110,9 +110,9 @@ __device__ bool exec_system(HartState* hart, Machine* m, uint32_t insn, int insn
         } else {
             tlb_flush_addr(hart->itlb, vaddr >> 12);
             tlb_flush_addr(hart->dtlb, vaddr >> 12);
-            // Targeted icache invalidation: flush entries in the page
+            // Targeted icache invalidation
             uint32_t base_idx = ((uint32_t)(vaddr >> 1)) & ICACHE_MASK;
-            g_icache[base_idx].valid = 0;
+            hart_icache()[base_idx].valid = 0;
         }
         return false; // advance PC normally
     }

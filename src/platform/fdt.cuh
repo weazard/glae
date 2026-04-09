@@ -116,7 +116,7 @@ struct FdtBuilder {
 
 // Build the device tree for our virtual machine
 static int build_fdt(uint8_t* buffer, uint64_t dram_base, uint64_t dram_size,
-                     const char* bootargs) {
+                     const char* bootargs, int num_harts = 1) {
     // Reserve space for header (40 bytes) + memory reservation (16+16 bytes)
     int header_size = 40;
     int memrsv_size = 16; // one empty entry (8+8 bytes of zeros)
@@ -124,9 +124,9 @@ static int build_fdt(uint8_t* buffer, uint64_t dram_base, uint64_t dram_size,
     FdtBuilder fdt;
     fdt.init(buffer + header_size + memrsv_size);
 
-    // Phandle assignments
-    uint32_t ph_cpu_intc = 1;
-    uint32_t ph_plic = 2;
+    // Phandle assignments: cpu intc phandles = 10+i, plic = 10+num_harts
+    // (start at 10 to avoid conflicts)
+    uint32_t ph_plic = 10 + num_harts;
 
     // Root node
     fdt.begin_node("");
@@ -151,28 +151,32 @@ static int build_fdt(uint8_t* buffer, uint64_t dram_base, uint64_t dram_size,
     fdt.prop_cells("reg", reg_mem, 4);
     fdt.end_node();
 
-    // /cpus
+    // /cpus — generate one node per hart
     fdt.begin_node("cpus");
     fdt.prop_u32("#address-cells", 1);
     fdt.prop_u32("#size-cells", 0);
     fdt.prop_u32("timebase-frequency", 10000000);
 
-    fdt.begin_node("cpu@0");
-    fdt.prop_str("device_type", "cpu");
-    fdt.prop_u32("reg", 0);
-    fdt.prop_str("compatible", "riscv");
-    fdt.prop_str("riscv,isa", "rv64imafdcsu");
-    fdt.prop_str("mmu-type", "riscv,sv39");
-    fdt.prop_str("status", "okay");
+    for (int h = 0; h < num_harts; h++) {
+        char name[32];
+        snprintf(name, sizeof(name), "cpu@%d", h);
+        fdt.begin_node(name);
+        fdt.prop_str("device_type", "cpu");
+        fdt.prop_u32("reg", h);
+        fdt.prop_str("compatible", "riscv");
+        fdt.prop_str("riscv,isa", "rv64imafdcsu");
+        fdt.prop_str("mmu-type", "riscv,sv39");
+        fdt.prop_str("status", h == 0 ? "okay" : "okay");
 
-    fdt.begin_node("interrupt-controller");
-    fdt.prop_u32("#interrupt-cells", 1);
-    fdt.prop_str("compatible", "riscv,cpu-intc");
-    fdt.prop_empty("interrupt-controller");
-    fdt.prop_phandle("phandle", ph_cpu_intc);
-    fdt.end_node(); // interrupt-controller
+        fdt.begin_node("interrupt-controller");
+        fdt.prop_u32("#interrupt-cells", 1);
+        fdt.prop_str("compatible", "riscv,cpu-intc");
+        fdt.prop_empty("interrupt-controller");
+        fdt.prop_phandle("phandle", 10 + h);
+        fdt.end_node();
 
-    fdt.end_node(); // cpu@0
+        fdt.end_node();
+    }
     fdt.end_node(); // cpus
 
     // /soc
@@ -182,24 +186,42 @@ static int build_fdt(uint8_t* buffer, uint64_t dram_base, uint64_t dram_size,
     fdt.prop_str("compatible", "simple-bus");
     fdt.prop_empty("ranges");
 
-    // clint@2000000
+    // clint@2000000 — interrupts-extended lists all harts
     fdt.begin_node("clint@2000000");
     fdt.prop_str("compatible", "riscv,clint0");
     uint32_t reg_clint[] = { 0, 0x02000000, 0, 0x10000 };
     fdt.prop_cells("reg", reg_clint, 4);
-    uint32_t clint_irqs[] = { ph_cpu_intc, 3, ph_cpu_intc, 7 };
-    fdt.prop_cells("interrupts-extended", clint_irqs, 4);
+    {
+        // Each hart: (phandle, 3=MSI, phandle, 7=MTI)
+        uint32_t clint_irqs[MAX_HARTS * 4];
+        for (int h = 0; h < num_harts; h++) {
+            clint_irqs[h*4+0] = 10 + h;  // cpu intc phandle
+            clint_irqs[h*4+1] = 3;       // M-mode software interrupt
+            clint_irqs[h*4+2] = 10 + h;
+            clint_irqs[h*4+3] = 7;       // M-mode timer interrupt
+        }
+        fdt.prop_cells("interrupts-extended", clint_irqs, num_harts * 4);
+    }
     fdt.end_node();
 
-    // plic@c000000
+    // plic@c000000 — interrupts-extended lists all harts
     fdt.begin_node("plic@c000000");
     fdt.prop_str("compatible", "sifive,plic-1.0.0");
     uint32_t reg_plic[] = { 0, 0x0c000000, 0, 0x04000000 };
     fdt.prop_cells("reg", reg_plic, 4);
     fdt.prop_u32("#interrupt-cells", 1);
     fdt.prop_empty("interrupt-controller");
-    uint32_t plic_irqs[] = { ph_cpu_intc, 9, ph_cpu_intc, 11 };
-    fdt.prop_cells("interrupts-extended", plic_irqs, 4);
+    {
+        // Each hart: (phandle, 9=SEI, phandle, 11=MEI)
+        uint32_t plic_irqs[MAX_HARTS * 4];
+        for (int h = 0; h < num_harts; h++) {
+            plic_irqs[h*4+0] = 10 + h;
+            plic_irqs[h*4+1] = 9;   // S-mode external interrupt
+            plic_irqs[h*4+2] = 10 + h;
+            plic_irqs[h*4+3] = 11;  // M-mode external interrupt
+        }
+        fdt.prop_cells("interrupts-extended", plic_irqs, num_harts * 4);
+    }
     fdt.prop_u32("riscv,ndev", 64);
     fdt.prop_phandle("phandle", ph_plic);
     fdt.end_node();

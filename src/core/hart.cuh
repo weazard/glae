@@ -7,6 +7,20 @@
 enum PrivMode : uint8_t { PRV_U = 0, PRV_S = 1, PRV_M = 3 };
 
 // ============================================================
+// SBI HSM hart states
+// ============================================================
+enum HartStatus : uint32_t {
+    HSM_STARTED        = 0,
+    HSM_STOPPED        = 1,
+    HSM_START_PENDING   = 2,
+    HSM_STOP_PENDING    = 3,
+    HSM_SUSPENDED       = 4,
+};
+
+// Maximum harts supported
+#define MAX_HARTS 256
+
+// ============================================================
 // Yield reasons (GPU → CPU communication)
 // ============================================================
 enum YieldReason : uint32_t {
@@ -340,6 +354,11 @@ struct HartState {
     // Execution control
     uint32_t yield_reason;
     uint8_t  wfi;
+
+    // SMP / HSM state
+    HartStatus hsm_status;
+    uint64_t   hsm_start_addr;   // PC to jump to when started
+    uint64_t   hsm_start_arg;    // a1 value when started (opaque)
 
     // Set x[0] = 0 (call after every instruction)
     __device__ void zero_x0() { x[0] = 0; }

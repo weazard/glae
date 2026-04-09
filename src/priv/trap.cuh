@@ -4,10 +4,20 @@
 // ============================================================
 // Trap entry
 // ============================================================
+// Track illegal instruction traps for debugging
+static __device__ uint32_t g_illegal_count = 0;
+
 __device__ void take_trap(HartState* hart, uint64_t cause, uint64_t pc, uint64_t tval) {
     bool is_interrupt = (cause >> 63) & 1;
     uint64_t code = cause & ~CAUSE_INTERRUPT_BIT;
 
+    // Log first few illegal instruction traps — these indicate missing ISA support
+    if (!is_interrupt && code == EXC_ILLEGAL_INSN && g_illegal_count < 5) {
+        printf("[TRAP] ILLEGAL INSN at pc=%llx insn=%08llx hart=%llu priv=%d\n",
+               (unsigned long long)pc, (unsigned long long)tval,
+               (unsigned long long)hart->mhartid, hart->priv);
+        g_illegal_count++;
+    }
 
     // Determine target privilege: check delegation
     bool delegate = false;

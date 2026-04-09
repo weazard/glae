@@ -6,6 +6,7 @@
 #include "../isa/rv64a.cuh"
 #include "../isa/rv64f.cuh"
 #include "../isa/rv64d.cuh"
+#include "../isa/rv64zb.cuh"
 #include "../isa/system.cuh"
 
 // ============================================================
@@ -60,29 +61,42 @@ __device__ bool execute(HartState* hart, Machine* m, uint32_t insn, int insn_len
         return exec_store(hart, m, insn);
 
     case OP_OP_IMM:
+        // Try Zbb/Zbs immediate forms first (they share this opcode)
+        if (try_exec_zbb_imm(hart, insn)) return false;
+        if (try_exec_zbs_imm(hart, insn)) return false;
         exec_op_imm(hart, insn);
         return false;
 
     case OP_OP_IMM_32:
+        if (try_exec_zbb_imm32(hart, insn)) return false;
+        if (try_exec_zba_imm32(hart, insn)) return false;
         exec_op_imm_32(hart, insn);
         return false;
 
-    case OP_OP:
-        if (funct7(insn) == 0x01)
-            exec_mul(hart, insn);
-        else
-            exec_op_base(hart, insn);
+    case OP_OP: {
+        uint32_t f7 = funct7(insn);
+        if (f7 == 0x01) { exec_mul(hart, insn); return false; }
+        // Try Zba/Zbb/Zbs (they use various funct7 values on OP)
+        if (try_exec_zba_op(hart, insn)) return false;
+        if (try_exec_zbb_op(hart, insn)) return false;
+        if (try_exec_zbs_op(hart, insn)) return false;
+        exec_op_base(hart, insn);
         return false;
+    }
 
-    case OP_OP_32:
-        if (funct7(insn) == 0x01)
-            exec_mul_32(hart, insn);
-        else
-            exec_op_32_base(hart, insn);
+    case OP_OP_32: {
+        uint32_t f7 = funct7(insn);
+        if (f7 == 0x01) { exec_mul_32(hart, insn); return false; }
+        if (try_exec_zba_op32(hart, insn)) return false;
+        if (try_exec_zbb_op32(hart, insn)) return false;
+        exec_op_32_base(hart, insn);
         return false;
+    }
 
-    case OP_MISC_MEM: // FENCE — treated as no-op for single hart
-        return false;
+    case OP_MISC_MEM:
+        // FENCE variants + CBO instructions
+        if (try_exec_cbo(hart, m, insn)) return false;
+        return false;  // plain FENCE = NOP
 
     case OP_SYSTEM:
         return exec_system(hart, m, insn, insn_len);
@@ -98,16 +112,12 @@ __device__ bool execute(HartState* hart, Machine* m, uint32_t insn, int insn_len
         return exec_store_fp(hart, m, insn);
 
     case OP_OP_FP: {
-        // Dispatch by fmt field (bits 26:25)
         uint32_t fmt = (insn >> 25) & 3;
-        if (fmt == 0) return exec_op_fp_s(hart, insn);      // S format
-        if (fmt == 1) return exec_op_fp_d(hart, insn);      // D format
-        // Handle cross-format in individual handlers (FCVT.S.D, FCVT.D.S)
+        if (fmt == 0) return exec_op_fp_s(hart, insn);
+        if (fmt == 1) return exec_op_fp_d(hart, insn);
         uint32_t f7 = funct7(insn);
-        if (f7 == 0x20 || f7 == 0x21) {
-            if (f7 == 0x20) return exec_op_fp_s(hart, insn); // FCVT.S.D
-            if (f7 == 0x21) return exec_op_fp_d(hart, insn); // FCVT.D.S
-        }
+        if (f7 == 0x20) return exec_op_fp_s(hart, insn);
+        if (f7 == 0x21) return exec_op_fp_d(hart, insn);
         take_trap(hart, EXC_ILLEGAL_INSN, hart->pc, insn);
         return true;
     }

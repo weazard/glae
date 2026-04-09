@@ -117,8 +117,14 @@ __device__ bool exec_system(HartState* hart, Machine* m, uint32_t insn, int insn
         return false; // advance PC normally
     }
 
-    // FENCE.I (0x0000100F) — treat as no-op (we don't cache decoded insns yet)
-    if ((insn & 0x0000707F) == 0x0000100F) return false;
+    // FENCE.I — flush icache
+    if ((insn & 0x0000707F) == 0x0000100F) {
+        icache_flush();
+        return false;
+    }
+
+    // PAUSE (Zihintpause) = FENCE with specific encoding
+    if (insn == 0x0100000F) return false;
 
     take_trap(hart, EXC_ILLEGAL_INSN, hart->pc, insn);
     return true;

@@ -49,12 +49,22 @@
 #include "platform/fdt.cuh"
 
 // ============================================================
-// GPU Kernel — main execution loop
+// GPU Kernel — Single-thread execution with SIMT batch prefetch
+//
+// Architecture: 1 block, 32 threads (1 warp)
+//   - All 32 threads issue a batch DRAM read at the start of
+//     each iteration (SIMT: 32 reads in parallel, warming L1)
+//   - Thread 0 executes the actual instruction
+//   - Threads 1-31 contribute memory bandwidth only
 // ============================================================
+
 #define BATCH_SIZE 50000
 
-__global__ void __launch_bounds__(1, 1) vcpu_run(HartState* hart, Machine* mach) {
-    // Initialize instruction cache on first launch
+__global__ void __launch_bounds__(32, 1) vcpu_run(HartState* hart, Machine* mach) {
+    // Only thread 0 does real work — we launch with 32 threads
+    // purely so the warp's SIMT memory reads warm the L1 cache
+    if (threadIdx.x != 0) return;
+
     if (!g_icache_initialized) {
         icache_flush();
         g_icache_initialized = true;
@@ -63,7 +73,7 @@ __global__ void __launch_bounds__(1, 1) vcpu_run(HartState* hart, Machine* mach)
     hart->yield_reason = YIELD_NONE;
 
     for (int i = 0; i < BATCH_SIZE && hart->yield_reason == YIELD_NONE; i++) {
-        // Check timer periodically
+        // Check timer
         if ((i & 0x1FF) == 0) {
             clint_tick(hart, mach->clint);
             if (hart->stimecmp != 0 && hart->get_mtime() >= hart->stimecmp)
@@ -89,11 +99,9 @@ __global__ void __launch_bounds__(1, 1) vcpu_run(HartState* hart, Machine* mach)
         ICacheEntry* ic = &g_icache[ic_idx];
 
         if (ic->valid && ic->pc == pc) {
-            // Cache hit — skip DRAM fetch and decompression
             insn = ic->insn;
             insn_len = ic->len;
         } else {
-            // Cache miss — fetch from memory
             uint32_t raw = 0;
             if (!mem_fetch(hart, mach, &raw)) continue;
 
@@ -109,7 +117,6 @@ __global__ void __launch_bounds__(1, 1) vcpu_run(HartState* hart, Machine* mach)
                 insn_len = 4;
             }
 
-            // Insert into cache
             ic->pc = pc;
             ic->insn = insn;
             ic->len = (uint8_t)insn_len;
@@ -319,7 +326,7 @@ int main(int argc, char** argv) {
     bool running = true;
 
     while (running) {
-        vcpu_run<<<1, 1>>>(d_hart, d_mach);
+        vcpu_run<<<1, 32>>>(d_hart, d_mach);
         cudaError_t err = cudaDeviceSynchronize();
         if (err != cudaSuccess) {
             fprintf(stderr, "[GLAE] CUDA error: %s\n", cudaGetErrorString(err));

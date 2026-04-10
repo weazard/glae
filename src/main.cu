@@ -10,6 +10,7 @@
 #include <unistd.h>
 #include <fcntl.h>
 #include <termios.h>
+#include <signal.h>
 
 // Platform
 #include "platform/ring.h"
@@ -56,12 +57,25 @@
 
 #define BATCH_SIZE 50000
 
+#define CUDA_CHECK(call) do { \
+    cudaError_t _err = (call); \
+    if (_err != cudaSuccess) { \
+        fprintf(stderr, "[GLAE] CUDA error: %s (%s:%d)\n", \
+                cudaGetErrorString(_err), __FILE__, __LINE__); \
+        exit(1); \
+    } \
+} while (0)
+
 __global__ void __launch_bounds__(32, 1)
 vcpu_run(HartState* harts, Machine* mach) {
     const int hart_id = blockIdx.x;
     if (threadIdx.x != 0) return;
 
     HartState* hart = &harts[hart_id];
+
+    // Initialize gpu_clock_base on first execution
+    if (hart->gpu_clock_base == 0)
+        hart->gpu_clock_base = clock64();
 
     // Check HSM state — non-boot harts may be STOPPED
     if (hart->hsm_status == HSM_STOPPED) {
@@ -96,9 +110,10 @@ vcpu_run(HartState* harts, Machine* mach) {
             clint_tick(hart, mach->clint);
             if (hart->stimecmp != 0 && hart->get_mtime() >= hart->stimecmp)
                 hart->mip |= MIP_STIP;
-            // Only hart 0 updates PLIC (simplification — PLIC is shared)
-            if (hart_id == 0)
-                plic_update_ext(hart, mach->plic);
+            // UART → PLIC: set IRQ 10 if UART has pending interrupt
+            if (!(uart_compute_iir(mach->uart) & 0x01))
+                plic_set_pending(mach->plic, 10);
+            plic_update_ext(hart, mach->plic, hart_id);
         }
 
         // Interrupt check
@@ -178,6 +193,8 @@ static void init_hart(HartState* h, int hartid, uint64_t entry_pc,
 
     h->gpu_clock_freq = gpu_freq;
     h->stimecmp = UINT64_MAX;
+    h->mcounteren = 7;  // CY, TM, IR: allow S-mode counter access
+    h->scounteren = 7;  // Allow U-mode counter access
 
     for (int i = 0; i < TLB_SIZE; i++) {
         h->itlb[i].valid = 0;
@@ -200,6 +217,20 @@ static void init_hart(HartState* h, int hartid, uint64_t entry_pc,
 static void set_nonblocking_stdin() {
     int flags = fcntl(STDIN_FILENO, F_GETFL, 0);
     fcntl(STDIN_FILENO, F_SETFL, flags | O_NONBLOCK);
+}
+
+// Terminal restore on abnormal exit
+static struct termios g_old_term;
+static bool g_term_modified = false;
+
+static void restore_terminal() {
+    if (g_term_modified)
+        tcsetattr(STDIN_FILENO, TCSANOW, &g_old_term);
+}
+
+static void signal_handler(int sig) {
+    restore_terminal();
+    _exit(128 + sig);
 }
 
 int main(int argc, char** argv) {
@@ -225,7 +256,7 @@ int main(int argc, char** argv) {
     bool debug = getenv("GLAE_DEBUG") != nullptr;
 
     cudaDeviceProp prop;
-    cudaGetDeviceProperties(&prop, 0);
+    CUDA_CHECK(cudaGetDeviceProperties(&prop, 0));
     uint64_t gpu_freq = (uint64_t)prop.clockRate * 1000;
 
     if (debug) {
@@ -244,18 +275,21 @@ int main(int argc, char** argv) {
     long kernel_size = ftell(f);
     fseek(f, 0, SEEK_SET);
     uint8_t* kernel_data = (uint8_t*)malloc(kernel_size);
-    fread(kernel_data, 1, kernel_size, f);
+    if (fread(kernel_data, 1, kernel_size, f) != (size_t)kernel_size) {
+        fprintf(stderr, "Failed to read kernel\n");
+        free(kernel_data); fclose(f); return 1;
+    }
     fclose(f);
 
     if (debug) printf("[GLAE] Kernel: %s (%ld bytes)\n", kernel_path, kernel_size);
 
     // Allocate guest DRAM
     uint8_t* d_dram;
-    cudaMalloc(&d_dram, dram_size);
-    cudaMemset(d_dram, 0, dram_size);
+    CUDA_CHECK(cudaMalloc(&d_dram, dram_size));
+    CUDA_CHECK(cudaMemset(d_dram, 0, dram_size));
 
     uint64_t kernel_offset = 0;
-    cudaMemcpy(d_dram + kernel_offset, kernel_data, kernel_size, cudaMemcpyHostToDevice);
+    CUDA_CHECK(cudaMemcpy(d_dram + kernel_offset, kernel_data, kernel_size, cudaMemcpyHostToDevice));
     uint64_t entry_pc = DRAM_BASE + kernel_offset;
 
     // Build FDT with N CPUs
@@ -264,7 +298,13 @@ int main(int argc, char** argv) {
     int fdt_size = build_fdt(fdt_buf, DRAM_BASE, dram_size, bootargs, num_harts);
 
     uint64_t dtb_offset = dram_size - 0x200000;
-    cudaMemcpy(d_dram + dtb_offset, fdt_buf, fdt_size, cudaMemcpyHostToDevice);
+    if ((uint64_t)kernel_size > dtb_offset) {
+        fprintf(stderr, "[GLAE] ERROR: kernel (%ld bytes) overlaps FDT at offset 0x%llx\n",
+                kernel_size, (unsigned long long)dtb_offset);
+        free(fdt_buf); free(kernel_data);
+        return 1;
+    }
+    CUDA_CHECK(cudaMemcpy(d_dram + dtb_offset, fdt_buf, fdt_size, cudaMemcpyHostToDevice));
     uint64_t dtb_addr = DRAM_BASE + dtb_offset;
     free(fdt_buf);
 
@@ -274,71 +314,74 @@ int main(int argc, char** argv) {
     // Allocate ring buffers
     Ring* tx_ring;
     Ring* rx_ring;
-    cudaMallocHost(&tx_ring, sizeof(Ring));
-    cudaMallocHost(&rx_ring, sizeof(Ring));
+    CUDA_CHECK(cudaMallocHost(&tx_ring, sizeof(Ring)));
+    CUDA_CHECK(cudaMallocHost(&rx_ring, sizeof(Ring)));
     memset(tx_ring, 0, sizeof(Ring));
     memset(rx_ring, 0, sizeof(Ring));
 
     // Allocate devices
     Uart* d_uart;
-    cudaMalloc(&d_uart, sizeof(Uart));
+    CUDA_CHECK(cudaMalloc(&d_uart, sizeof(Uart)));
     Uart h_uart = {};
     h_uart.tx_ring = tx_ring;
     h_uart.rx_ring = rx_ring;
     h_uart.lcr = 0x03;
     h_uart.iir = 0x01;
-    cudaMemcpy(d_uart, &h_uart, sizeof(Uart), cudaMemcpyHostToDevice);
+    CUDA_CHECK(cudaMemcpy(d_uart, &h_uart, sizeof(Uart), cudaMemcpyHostToDevice));
 
     Clint* d_clint;
-    cudaMalloc(&d_clint, sizeof(Clint));
+    CUDA_CHECK(cudaMalloc(&d_clint, sizeof(Clint)));
     {
         Clint h_clint = {};
         for (int i = 0; i < MAX_HARTS; i++) h_clint.mtimecmp[i] = UINT64_MAX;
-        cudaMemcpy(d_clint, &h_clint, sizeof(Clint), cudaMemcpyHostToDevice);
+        CUDA_CHECK(cudaMemcpy(d_clint, &h_clint, sizeof(Clint), cudaMemcpyHostToDevice));
     }
 
     Plic* d_plic;
-    cudaMalloc(&d_plic, sizeof(Plic));
-    cudaMemset(d_plic, 0, sizeof(Plic));
+    CUDA_CHECK(cudaMalloc(&d_plic, sizeof(Plic)));
+    CUDA_CHECK(cudaMemset(d_plic, 0, sizeof(Plic)));
 
     // Allocate N hart states
     HartState* d_harts;
-    cudaMalloc(&d_harts, num_harts * sizeof(HartState));
+    CUDA_CHECK(cudaMalloc(&d_harts, num_harts * sizeof(HartState)));
     {
         HartState* h_harts = (HartState*)calloc(num_harts, sizeof(HartState));
         for (int i = 0; i < num_harts; i++)
             init_hart(&h_harts[i], i, entry_pc, dtb_addr, gpu_freq, i == 0);
-        cudaMemcpy(d_harts, h_harts, num_harts * sizeof(HartState), cudaMemcpyHostToDevice);
+        CUDA_CHECK(cudaMemcpy(d_harts, h_harts, num_harts * sizeof(HartState), cudaMemcpyHostToDevice));
         free(h_harts);
     }
 
     // Allocate per-hart instruction caches
     ICacheEntry* d_icache_pool;
-    cudaMalloc(&d_icache_pool, num_harts * ICACHE_ENTRIES * sizeof(ICacheEntry));
-    cudaMemset(d_icache_pool, 0, num_harts * ICACHE_ENTRIES * sizeof(ICacheEntry));
-    cudaMemcpyToSymbol(g_icache_pool, &d_icache_pool, sizeof(ICacheEntry*));
-    cudaMemcpyToSymbol(g_num_harts, &num_harts, sizeof(int));
+    CUDA_CHECK(cudaMalloc(&d_icache_pool, num_harts * ICACHE_ENTRIES * sizeof(ICacheEntry)));
+    CUDA_CHECK(cudaMemset(d_icache_pool, 0, num_harts * ICACHE_ENTRIES * sizeof(ICacheEntry)));
+    CUDA_CHECK(cudaMemcpyToSymbol(g_icache_pool, &d_icache_pool, sizeof(ICacheEntry*)));
+    CUDA_CHECK(cudaMemcpyToSymbol(g_num_harts, &num_harts, sizeof(int)));
 
     // Machine struct
     Machine* d_mach;
-    cudaMalloc(&d_mach, sizeof(Machine));
+    CUDA_CHECK(cudaMalloc(&d_mach, sizeof(Machine)));
     Machine h_mach = { d_dram, dram_size, d_uart, d_clint, d_plic, d_harts, num_harts };
-    cudaMemcpy(d_mach, &h_mach, sizeof(Machine), cudaMemcpyHostToDevice);
+    CUDA_CHECK(cudaMemcpy(d_mach, &h_mach, sizeof(Machine), cudaMemcpyHostToDevice));
 
     // Debug flag
     bool h_debug = debug;
-    cudaMemcpyToSymbol(g_debug, &h_debug, sizeof(bool));
+    CUDA_CHECK(cudaMemcpyToSymbol(g_debug, &h_debug, sizeof(bool)));
 
-    cudaDeviceSynchronize();
+    CUDA_CHECK(cudaDeviceSynchronize());
 
     if (debug) printf("[GLAE] Starting execution (%d harts)...\n\n", num_harts);
 
     set_nonblocking_stdin();
-    struct termios old_term, new_term;
-    tcgetattr(STDIN_FILENO, &old_term);
-    new_term = old_term;
+    tcgetattr(STDIN_FILENO, &g_old_term);
+    struct termios new_term = g_old_term;
     new_term.c_lflag &= ~(ICANON | ECHO);
     tcsetattr(STDIN_FILENO, TCSANOW, &new_term);
+    g_term_modified = true;
+    atexit(restore_terminal);
+    signal(SIGINT, signal_handler);
+    signal(SIGTERM, signal_handler);
 
     auto t_start = std::chrono::high_resolution_clock::now();
     uint64_t total_batches = 0;
@@ -393,7 +436,23 @@ int main(int argc, char** argv) {
                     if (status == HSM_START_PENDING) any_wfi = true; // will start next batch
                 }
             }
-            if (any_wfi) usleep(1000);
+            if (any_wfi) {
+                usleep(1000);
+                // Advance guest time for WFI harts: clock64() doesn't tick while
+                // the GPU kernel isn't running, so subtract from gpu_clock_base
+                // to simulate 1ms of elapsed time per sleep cycle.
+                uint64_t advance = gpu_freq / 1000;  // 1ms worth of GPU cycles
+                for (int h = 0; h < num_harts; h++) {
+                    uint32_t yield;
+                    cudaMemcpy(&yield, &d_harts[h].yield_reason, sizeof(uint32_t), cudaMemcpyDeviceToHost);
+                    if (yield == YIELD_WFI) {
+                        uint64_t base;
+                        cudaMemcpy(&base, &d_harts[h].gpu_clock_base, sizeof(uint64_t), cudaMemcpyDeviceToHost);
+                        base -= advance;
+                        cudaMemcpy(&d_harts[h].gpu_clock_base, &base, sizeof(uint64_t), cudaMemcpyHostToDevice);
+                    }
+                }
+            }
             else { running = false; }  // all halted permanently
         }
 
@@ -430,7 +489,7 @@ int main(int argc, char** argv) {
                (unsigned long long)total_insns, elapsed, total_insns / elapsed / 1e6);
     }
 
-    tcsetattr(STDIN_FILENO, TCSANOW, &old_term);
+    restore_terminal();
     cudaFreeHost(tx_ring);
     cudaFreeHost(rx_ring);
     cudaFree(d_harts);

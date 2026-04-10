@@ -95,9 +95,7 @@ __device__ bool try_exec_zbb_op(HartState* hart, uint32_t insn) {
         }
     } else if (f7 == 0x30) {
         switch (f3) {
-        case 1: result = (a << (b & 63)) | (a >> (64 - (b & 63)) & 63 ? (64 - (b & 63)) : 0); // ROL
-                result = (a << (b & 63)) | (a >> ((64 - (b & 63)) & 63));
-                break;
+        case 1: result = (a << (b & 63)) | (a >> ((64 - (b & 63)) & 63)); break; // ROL
         case 5: result = (a >> (b & 63)) | (a << ((64 - (b & 63)) & 63));  // ROR
                 break;
         default: return false;
@@ -171,10 +169,6 @@ __device__ bool try_exec_zbb_imm(HartState* hart, uint32_t insn) {
         }
     } else if (f3 == 5 && imm12 == 0x6B8) {
         // REV8: byte-reverse
-        result = __brev((uint32_t)(a >> 32));
-        result |= (uint64_t)__brev((uint32_t)a) << 32;
-        // __brev is bit-reverse, we need byte-reverse
-        result = __byte_perm((uint32_t)a, (uint32_t)(a >> 32), 0x0123);
         uint32_t lo = (uint32_t)a, hi = (uint32_t)(a >> 32);
         lo = ((lo >> 24) & 0xFF) | ((lo >> 8) & 0xFF00) | ((lo << 8) & 0xFF0000) | ((lo << 24) & 0xFF000000);
         hi = ((hi >> 24) & 0xFF) | ((hi >> 8) & 0xFF00) | ((hi << 8) & 0xFF0000) | ((hi << 24) & 0xFF000000);

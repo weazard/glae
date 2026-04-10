@@ -160,6 +160,13 @@ enum YieldReason : uint32_t {
 #define CSR_FRM         0x002
 #define CSR_FCSR        0x003
 
+// RISC-V FP exception flags (fcsr bits 4:0)
+#define FFLAG_NX (1U << 0)  // Inexact
+#define FFLAG_UF (1U << 1)  // Underflow
+#define FFLAG_OF (1U << 2)  // Overflow
+#define FFLAG_DZ (1U << 3)  // Divide by Zero
+#define FFLAG_NV (1U << 4)  // Invalid Operation
+
 // ============================================================
 // Interrupt masks
 // ============================================================
@@ -198,7 +205,7 @@ enum YieldReason : uint32_t {
 struct TLBEntry {
     uint64_t tag;     // vpn | (asid << 27)
     uint64_t ppn;
-    uint8_t  perm;    // bits: [D:6][A:5][G:4][U:3][X:2][W:1][R:0]
+    uint8_t  perm;    // raw PTE bits: [D:7][A:6][G:5][U:4][X:3][W:2][R:1][V:0]
     uint8_t  level;   // 0=4KB, 1=2MB, 2=1GB
     uint8_t  valid;
     uint8_t  pad;
@@ -363,10 +370,11 @@ struct HartState {
     // Set x[0] = 0 (call after every instruction)
     __device__ void zero_x0() { x[0] = 0; }
 
-    // Get mtime from GPU clock
+    // Get mtime from GPU clock (overflow-safe: divide first)
     __device__ uint64_t get_mtime() const {
         uint64_t elapsed = clock64() - gpu_clock_base;
-        return (elapsed * TIMEBASE_FREQ) / gpu_clock_freq;
+        return (elapsed / gpu_clock_freq) * TIMEBASE_FREQ +
+               (elapsed % gpu_clock_freq) * TIMEBASE_FREQ / gpu_clock_freq;
     }
 
     // FS field helpers
@@ -388,3 +396,19 @@ struct HartState {
         else            mstatus &= ~MSTATUS_SPP;
     }
 };
+
+// Resolve rounding mode: rm=7 means use frm from fcsr
+__device__ __forceinline__ uint32_t resolve_rm(const HartState* hart, uint32_t rm) {
+    return (rm == 7) ? ((hart->fcsr >> 5) & 7) : rm;
+}
+
+// Signaling NaN detection
+__device__ __forceinline__ bool is_snan_f(float f) {
+    uint32_t b = __float_as_uint(f);
+    return ((b >> 23) & 0xFF) == 0xFF && (b & 0x7FFFFF) && !(b & 0x400000);
+}
+__device__ __forceinline__ bool is_snan_d(uint64_t bits) {
+    uint32_t exp = (bits >> 52) & 0x7FF;
+    uint64_t frac = bits & 0xFFFFFFFFFFFFFULL;
+    return exp == 0x7FF && frac && !(frac & (1ULL << 51));
+}

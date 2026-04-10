@@ -93,7 +93,6 @@ __device__ bool handle_sbi(HartState* hart, Machine* m) {
     case SBI_EXT_TIMER:
         if (fid == 0) {
             hart->stimecmp = a0;
-            if (my_id < MAX_HARTS) m->clint->mtimecmp[my_id] = a0;
             hart->mip &= ~MIP_STIP;
         } else {
             err = SBI_ERR_NOT_SUPPORTED;
@@ -108,7 +107,8 @@ __device__ bool handle_sbi(HartState* hart, Machine* m) {
             uint64_t base = hart->x[11]; // a1
             for (int i = 0; i < 64 && (base + i) < (uint64_t)m->num_harts; i++) {
                 if (mask & (1ULL << i)) {
-                    m->all_harts[base + i].mip |= MIP_SSIP;
+                    atomicOr((unsigned long long*)&m->all_harts[base + i].mip,
+                             (unsigned long long)MIP_SSIP);
                 }
             }
         } else {

@@ -53,10 +53,13 @@ __device__ bool bus_store(HartState* hart, Machine* m, uint64_t paddr, int size,
     if (paddr >= DRAM_BASE && paddr < DRAM_BASE + m->dram_size) {
         uint64_t off = paddr - DRAM_BASE;
         safe_write(m->dram + off, val, size);
-        // Invalidate LR/SC reservation on store
-        if (hart->reservation_valid) {
-            if (paddr <= hart->reservation_addr && hart->reservation_addr < paddr + size)
-                hart->reservation_valid = 0;
+        // Invalidate LR/SC reservation on store (all harts — SMP correctness)
+        for (int h = 0; h < m->num_harts; h++) {
+            if (m->all_harts[h].reservation_valid) {
+                if (paddr <= m->all_harts[h].reservation_addr &&
+                    m->all_harts[h].reservation_addr < paddr + size)
+                    m->all_harts[h].reservation_valid = 0;
+            }
         }
         return true;
     }

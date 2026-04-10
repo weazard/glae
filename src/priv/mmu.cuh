@@ -53,8 +53,17 @@ __device__ void tlb_flush(TLBEntry* tlb) {
 }
 
 __device__ void tlb_flush_addr(TLBEntry* tlb, uint64_t vpn) {
+    // Direct-mapped flush + scan for superpages that may cover this vpn
     int idx = tlb_index(vpn);
     tlb[idx].valid = 0;
+    // Also check for superpage entries at other indices
+    for (int i = 0; i < TLB_SIZE; i++) {
+        if (!tlb[i].valid || tlb[i].level == 0) continue;
+        uint64_t entry_vpn = tlb[i].tag & ((1ULL << 27) - 1);
+        uint64_t mask = (tlb[i].level == 2) ? 0x3FFFF : 0x1FF;
+        if ((vpn & ~mask) == (entry_vpn & ~mask))
+            tlb[i].valid = 0;
+    }
 }
 
 // ============================================================

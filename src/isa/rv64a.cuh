@@ -102,6 +102,12 @@ __device__ bool exec_amo(HartState* hart, Machine* m, uint32_t insn) {
     }
 
     // ---- AMO (Atomic Read-Modify-Write) ----
+    uint32_t aq = (insn >> 26) & 1;
+    uint32_t rl = (insn >> 25) & 1;
+
+    // Release fence before AMO
+    if (rl) __threadfence();
+
     uint64_t old_val;
 
     if (is_word) {
@@ -146,10 +152,8 @@ __device__ bool exec_amo(HartState* hart, Machine* m, uint32_t insn) {
         old_val = old;
     }
 
-    // Memory fence for acquire/release
-    uint32_t aq = (insn >> 26) & 1;
-    uint32_t rl = (insn >> 25) & 1;
-    if (aq || rl) __threadfence();
+    // Acquire fence after AMO
+    if (aq) __threadfence();
 
     if (d != 0) hart->x[d] = old_val;
     return false;

@@ -23,6 +23,16 @@ __device__ uint8_t uart_lsr(Uart* u) {
     return lsr;
 }
 
+// Compute actual IIR based on IER and pending conditions
+__device__ uint8_t uart_compute_iir(Uart* u) {
+    // Priority: Receiver Line Status (0x06) > RX Data (0x04) > THR Empty (0x02)
+    if ((u->ier & 0x01) && !ring_empty(u->rx_ring))
+        return 0x04;  // Received Data Available, interrupt pending (bit 0 = 0)
+    if ((u->ier & 0x02) && u->irq_pending)
+        return 0x02;  // THR Empty (only after TX write re-arms it)
+    return 0x01;       // No interrupt pending (bit 0 = 1)
+}
+
 __device__ uint64_t uart_read(Uart* u, uint64_t offset) {
     bool dlab = (u->lcr >> 7) & 1;
     switch (offset & 0x7) {
@@ -36,7 +46,13 @@ __device__ uint64_t uart_read(Uart* u, uint64_t offset) {
     case 1:
         if (dlab) return (u->divisor >> 8) & 0xFF;
         else return u->ier;
-    case 2: return u->iir | 0x01;  // no interrupt pending
+    case 2: {
+        uint8_t iir = uart_compute_iir(u);
+        if (u->fcr & 0x01) iir |= 0xC0;  // FIFOs enabled bits
+        // Reading IIR clears THR Empty interrupt
+        if ((iir & 0x0E) == 0x02) u->irq_pending = 0;
+        return iir;
+    }
     case 3: return u->lcr;
     case 4: return u->mcr;
     case 5: return uart_lsr(u);
@@ -54,6 +70,7 @@ __device__ void uart_write(HartState* hart, Uart* u, uint64_t offset, uint64_t v
         if (dlab) { u->divisor = (u->divisor & 0xFF00) | v; }
         else {
             ring_push(u->tx_ring, v);
+            u->irq_pending = 1;  // Re-arm THR Empty interrupt
             // Only yield when ring is getting full — batch characters
             if (ring_count(u->tx_ring) > RING_SIZE * 3 / 4) {
                 if (hart->yield_reason == YIELD_NONE)

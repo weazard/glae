@@ -1,5 +1,8 @@
 NVCC     := nvcc
-NVFLAGS  := -arch=sm_90 -O3 -std=c++17 --expt-relaxed-constexpr -lineinfo --use_fast_math
+CUDA_ARCH ?= sm_90
+NVFLAGS  := -gencode arch=compute_90,code=$(CUDA_ARCH) \
+            -gencode arch=compute_90,code=compute_90 \
+            -O3 -std=c++17 --expt-relaxed-constexpr -lineinfo
 TARGET   := glae
 SRC      := src/main.cu
 
@@ -7,7 +10,8 @@ SRC      := src/main.cu
 
 all: $(TARGET)
 
-$(TARGET): $(SRC) $(wildcard src/**/*.cuh src/**/*.h)
+HEADERS := $(shell find src -name '*.cuh' -o -name '*.h')
+$(TARGET): $(SRC) $(HEADERS)
 	$(NVCC) $(NVFLAGS) -o $@ $<
 
 test_payload: test/test_uart.bin

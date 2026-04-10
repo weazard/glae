@@ -54,12 +54,19 @@ __device__ bool csr_read(HartState* hart, uint32_t addr, uint64_t* val) {
     case CSR_MIMPID:    *val = 0; return true;
     case CSR_MHARTID:   *val = hart->mhartid; return true;
 
-    // --- Counters ---
+    // --- Counters (M-mode: no gating) ---
     case CSR_MCYCLE:
-    case CSR_CYCLE:     *val = hart->instret; return true;  // cycle ≈ instret
-    case CSR_MINSTRET:
-    case CSR_INSTRET:   *val = hart->instret; return true;
-    case CSR_TIME:      *val = hart->get_mtime(); return true;
+    case CSR_MINSTRET:  *val = hart->instret; return true;
+    // --- Counters (S/U-mode: gated by MCOUNTEREN/SCOUNTEREN) ---
+    case CSR_CYCLE:
+    case CSR_TIME:
+    case CSR_INSTRET: {
+        uint32_t bit = 1U << (addr - CSR_CYCLE);
+        if (hart->priv <= PRV_S && !(hart->mcounteren & bit)) return false;
+        if (hart->priv == PRV_U && !(hart->scounteren & bit)) return false;
+        *val = (addr == CSR_TIME) ? hart->get_mtime() : hart->instret;
+        return true;
+    }
 
     // --- PMP (stub — return 0) ---
     case CSR_PMPCFG0:
@@ -205,8 +212,8 @@ __device__ bool csr_write(HartState* hart, uint32_t addr, uint64_t val) {
         hart->mtval = val;
         return true;
     case CSR_MIP: {
-        // Only MSIP, SSIP, STIP are writable
-        uint64_t wmask = MIP_SSIP | MIP_STIP | MIP_MSIP;
+        // SSIP and STIP are writable; MSIP is read-only (CLINT-controlled)
+        uint64_t wmask = MIP_SSIP | MIP_STIP;
         hart->mip = (hart->mip & ~wmask) | (val & wmask);
         return true;
     }

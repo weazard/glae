@@ -105,12 +105,14 @@ __device__ void plic_set_pending(Plic* p, int irq) {
 }
 
 // Update hart external interrupt pending based on PLIC state
-__device__ void plic_update_ext(HartState* hart, Plic* p) {
-    if (plic_highest_pending(p, 1))  // S-mode context
+__device__ void plic_update_ext(HartState* hart, Plic* p, int hart_id) {
+    int ctx_m = hart_id * 2;       // M-mode context
+    int ctx_s = hart_id * 2 + 1;   // S-mode context
+    if (plic_highest_pending(p, ctx_s))
         hart->mip |= MIP_SEIP;
     else
         hart->mip &= ~MIP_SEIP;
-    if (plic_highest_pending(p, 0))  // M-mode context
+    if (plic_highest_pending(p, ctx_m))
         hart->mip |= MIP_MEIP;
     else
         hart->mip &= ~MIP_MEIP;

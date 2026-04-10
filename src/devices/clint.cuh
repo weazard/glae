@@ -43,9 +43,11 @@ __device__ void clint_write(HartState* hart, HartState* all_harts, Clint* c,
         if (target < MAX_HARTS) {
             c->msip[target] = val & 1;
             if (val & 1)
-                all_harts[target].mip |= MIP_MSIP;
+                atomicOr((unsigned long long*)&all_harts[target].mip,
+                         (unsigned long long)MIP_MSIP);
             else
-                all_harts[target].mip &= ~MIP_MSIP;
+                atomicAnd((unsigned long long*)&all_harts[target].mip,
+                          ~(unsigned long long)MIP_MSIP);
         }
         return;
     }

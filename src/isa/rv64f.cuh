@@ -16,6 +16,27 @@ __device__ __forceinline__ uint64_t box_f(float f) {
     return 0xFFFFFFFF00000000ULL | (uint64_t)__float_as_uint(f);
 }
 
+// Rounding-mode-aware float arithmetic using CUDA intrinsics
+__device__ __forceinline__ float fadd_rm(float a, float b, uint32_t rm) {
+    switch (rm) { case 1: return __fadd_rz(a,b); case 2: return __fadd_rd(a,b);
+                  case 3: return __fadd_ru(a,b); default: return __fadd_rn(a,b); }
+}
+__device__ __forceinline__ float fmul_rm(float a, float b, uint32_t rm) {
+    switch (rm) { case 1: return __fmul_rz(a,b); case 2: return __fmul_rd(a,b);
+                  case 3: return __fmul_ru(a,b); default: return __fmul_rn(a,b); }
+}
+__device__ __forceinline__ float fdiv_rm(float a, float b, uint32_t rm) {
+    switch (rm) { case 1: return __fdiv_rz(a,b); case 2: return __fdiv_rd(a,b);
+                  case 3: return __fdiv_ru(a,b); default: return __fdiv_rn(a,b); }
+}
+
+// Round float to integer value (as float) per rounding mode
+__device__ __forceinline__ float roundf_rm(float a, uint32_t rm) {
+    switch (rm) { case 1: return truncf(a); case 2: return floorf(a);
+                  case 3: return ceilf(a); case 4: return roundf(a);
+                  default: return rintf(a); }
+}
+
 // ============================================================
 // FP Load/Store
 // ============================================================
@@ -79,13 +100,18 @@ __device__ bool exec_op_fp_s(HartState* hart, uint32_t insn) {
     uint32_t rm = funct3(insn);
 
     hart->mark_fs_dirty();
+    uint32_t erm = resolve_rm(hart, rm);
 
     switch (f7) {
-    case 0x00: hart->f[d] = box_f(a + b); return false; // FADD.S
-    case 0x04: hart->f[d] = box_f(a - b); return false; // FSUB.S
-    case 0x08: hart->f[d] = box_f(a * b); return false; // FMUL.S
-    case 0x0C: hart->f[d] = box_f(a / b); return false; // FDIV.S
+    case 0x00: hart->f[d] = box_f(fadd_rm(a, b, erm)); return false;  // FADD.S
+    case 0x04: hart->f[d] = box_f(fadd_rm(a, -b, erm)); return false; // FSUB.S
+    case 0x08: hart->f[d] = box_f(fmul_rm(a, b, erm)); return false;  // FMUL.S
+    case 0x0C: // FDIV.S
+        if (b == 0.0f && isfinite(a) && a != 0.0f) hart->fcsr |= FFLAG_DZ;
+        hart->f[d] = box_f(fdiv_rm(a, b, erm));
+        return false;
     case 0x2C: // FSQRT.S
+        if (a < 0.0f && !isnan(a)) hart->fcsr |= FFLAG_NV;
         hart->f[d] = box_f(sqrtf(a));
         return false;
     case 0x10: // FSGNJ / FSGNJN / FSGNJX
@@ -111,26 +137,56 @@ __device__ bool exec_op_fp_s(HartState* hart, uint32_t insn) {
         }
         break;
     case 0x14: // FMIN.S / FMAX.S
+        if (is_snan_f(a) || is_snan_f(b)) hart->fcsr |= FFLAG_NV;
         if (rm == 0)      hart->f[d] = box_f(fminf(a, b));
         else if (rm == 1) hart->f[d] = box_f(fmaxf(a, b));
         return false;
     case 0x60: { // FCVT.W.S / FCVT.WU.S / FCVT.L.S / FCVT.LU.S
         uint32_t s2 = rs2(insn);
+        float r = roundf_rm(a, erm);
         switch (s2) {
-        case 0: if (d) hart->x[d] = (int64_t)(int32_t)__float2int_rn(a); return false; // FCVT.W.S
-        case 1: if (d) hart->x[d] = (int64_t)(int32_t)(uint32_t)__float2uint_rn(a); return false; // FCVT.WU.S
-        case 2: if (d) hart->x[d] = (int64_t)llrintf(a); return false; // FCVT.L.S
-        case 3: if (d) hart->x[d] = (uint64_t)(unsigned long long)llrintf(fabsf(a)); return false; // FCVT.LU.S
+        case 0: { // FCVT.W.S
+            int64_t v;
+            if (isnan(a) || r >= 0x1.0p31f) { v = INT32_MAX; hart->fcsr |= FFLAG_NV; }
+            else if (r < -0x1.0p31f) { v = (int64_t)(int32_t)INT32_MIN; hart->fcsr |= FFLAG_NV; }
+            else v = (int64_t)(int32_t)r;
+            if (d) hart->x[d] = v;
+            return false;
+        }
+        case 1: { // FCVT.WU.S
+            int64_t v;
+            if (isnan(a) || r >= 0x1.0p32f) { v = (int64_t)(int32_t)UINT32_MAX; hart->fcsr |= FFLAG_NV; }
+            else if (r < 0.0f) { v = 0; if (r != 0.0f) hart->fcsr |= FFLAG_NV; }
+            else v = (int64_t)(int32_t)(uint32_t)r;
+            if (d) hart->x[d] = v;
+            return false;
+        }
+        case 2: { // FCVT.L.S
+            int64_t v;
+            if (isnan(a) || r >= 0x1.0p63f) { v = INT64_MAX; hart->fcsr |= FFLAG_NV; }
+            else if (r < -0x1.0p63f) { v = INT64_MIN; hart->fcsr |= FFLAG_NV; }
+            else v = (int64_t)r;
+            if (d) hart->x[d] = (uint64_t)v;
+            return false;
+        }
+        case 3: { // FCVT.LU.S
+            uint64_t v;
+            if (isnan(a) || r >= 0x1.0p64f) { v = UINT64_MAX; hart->fcsr |= FFLAG_NV; }
+            else if (r < 0.0f) { v = 0; if (r != 0.0f) hart->fcsr |= FFLAG_NV; }
+            else v = (uint64_t)r;
+            if (d) hart->x[d] = v;
+            return false;
+        }
         }
         break;
     }
     case 0x68: { // FCVT.S.W / FCVT.S.WU / FCVT.S.L / FCVT.S.LU
         uint32_t s2 = rs2(insn);
         switch (s2) {
-        case 0: hart->f[d] = box_f((float)(int32_t)hart->x[rs1(insn)]); return false;
-        case 1: hart->f[d] = box_f((float)(uint32_t)hart->x[rs1(insn)]); return false;
-        case 2: hart->f[d] = box_f((float)(int64_t)hart->x[rs1(insn)]); return false;
-        case 3: hart->f[d] = box_f((float)(uint64_t)hart->x[rs1(insn)]); return false;
+        case 0: hart->f[d] = box_f(__int2float_rn((int32_t)hart->x[rs1(insn)])); return false;
+        case 1: hart->f[d] = box_f(__uint2float_rn((uint32_t)hart->x[rs1(insn)])); return false;
+        case 2: hart->f[d] = box_f(__ll2float_rn((long long)hart->x[rs1(insn)])); return false;
+        case 3: hart->f[d] = box_f(__ull2float_rn((unsigned long long)hart->x[rs1(insn)])); return false;
         }
         break;
     }
@@ -158,9 +214,15 @@ __device__ bool exec_op_fp_s(HartState* hart, uint32_t insn) {
         return false;
     case 0x50: // FEQ.S / FLT.S / FLE.S
         switch (rm) {
-        case 2: if (d) hart->x[d] = (a == b) ? 1 : 0; return false; // FEQ.S
-        case 1: if (d) hart->x[d] = (a < b) ? 1 : 0; return false;  // FLT.S
-        case 0: if (d) hart->x[d] = (a <= b) ? 1 : 0; return false; // FLE.S
+        case 2: // FEQ.S — NV only on signaling NaN
+            if (is_snan_f(a) || is_snan_f(b)) hart->fcsr |= FFLAG_NV;
+            if (d) hart->x[d] = (a == b) ? 1 : 0; return false;
+        case 1: // FLT.S — NV on any NaN
+            if (isnan(a) || isnan(b)) hart->fcsr |= FFLAG_NV;
+            if (d) hart->x[d] = (a < b) ? 1 : 0; return false;
+        case 0: // FLE.S — NV on any NaN
+            if (isnan(a) || isnan(b)) hart->fcsr |= FFLAG_NV;
+            if (d) hart->x[d] = (a <= b) ? 1 : 0; return false;
         }
         break;
     case 0x20: // FCVT.S.D

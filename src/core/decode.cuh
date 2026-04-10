@@ -96,6 +96,12 @@ __device__ bool execute(HartState* hart, Machine* m, uint32_t insn, int insn_len
     case OP_MISC_MEM:
         // CBO instructions
         if (try_exec_cbo(hart, m, insn)) return false;
+        // FENCE.I — flush icache + memory fence
+        if (funct3(insn) == 1) {
+            icache_flush();
+            __threadfence();
+            return false;
+        }
         // FENCE — ensure cross-SM memory visibility for SMP
         __threadfence();
         return false;

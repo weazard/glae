@@ -166,7 +166,7 @@ static int build_fdt(uint8_t* buffer, uint64_t dram_base, uint64_t dram_size,
         fdt.prop_str("compatible", "riscv");
         fdt.prop_str("riscv,isa", "rv64imafdcsu");
         fdt.prop_str("mmu-type", "riscv,sv39");
-        fdt.prop_str("status", h == 0 ? "okay" : "okay");
+        fdt.prop_str("status", "okay");
 
         fdt.begin_node("interrupt-controller");
         fdt.prop_u32("#interrupt-cells", 1);
@@ -212,13 +212,14 @@ static int build_fdt(uint8_t* buffer, uint64_t dram_base, uint64_t dram_size,
     fdt.prop_u32("#interrupt-cells", 1);
     fdt.prop_empty("interrupt-controller");
     {
-        // Each hart: (phandle, 9=SEI, phandle, 11=MEI)
+        // Each hart: (phandle, 11=MEI, phandle, 9=SEI)
+        // Order determines context IDs: ctx hart*2=M-mode, ctx hart*2+1=S-mode
         uint32_t plic_irqs[MAX_HARTS * 4];
         for (int h = 0; h < num_harts; h++) {
             plic_irqs[h*4+0] = 10 + h;
-            plic_irqs[h*4+1] = 9;   // S-mode external interrupt
+            plic_irqs[h*4+1] = 11;  // M-mode external interrupt (context h*2)
             plic_irqs[h*4+2] = 10 + h;
-            plic_irqs[h*4+3] = 11;  // M-mode external interrupt
+            plic_irqs[h*4+3] = 9;   // S-mode external interrupt (context h*2+1)
         }
         fdt.prop_cells("interrupts-extended", plic_irqs, num_harts * 4);
     }

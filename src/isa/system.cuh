@@ -80,12 +80,11 @@ __device__ bool exec_system(HartState* hart, Machine* m, uint32_t insn, int insn
             take_trap(hart, EXC_ILLEGAL_INSN, hart->pc, insn);
             return true;
         }
-        // Check if any interrupt is pending
+        // Check if any interrupt is pending; if not, enter WFI
+        // (persistent kernel handles the spin-wait inline)
         uint64_t pending = hart->mip & hart->mie;
-        if (pending == 0) {
+        if (pending == 0)
             hart->wfi = 1;
-            hart->yield_reason = YIELD_WFI;
-        }
         // WFI advances PC even if we enter wait
         hart->pc += insn_len;
         return true;

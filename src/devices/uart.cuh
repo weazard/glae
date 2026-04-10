@@ -71,11 +71,7 @@ __device__ void uart_write(HartState* hart, Uart* u, uint64_t offset, uint64_t v
         else {
             ring_push(u->tx_ring, v);
             u->irq_pending = 1;  // Re-arm THR Empty interrupt
-            // Only yield when ring is getting full — batch characters
-            if (ring_count(u->tx_ring) > RING_SIZE * 3 / 4) {
-                if (hart->yield_reason == YIELD_NONE)
-                    hart->yield_reason = YIELD_UART_TX;
-            }
+            // Host polls TX ring asynchronously — no yield needed
         }
         break;
     case 1:

@@ -1,6 +1,7 @@
 // ============================================================
 // GLAE — GPU-native RV64GC Hypervisor
-// SMP: one GPU block per hart, one warp per block
+// Persistent kernel: one GPU block per hart, runs until halt.
+// Host communicates via pinned memory only.
 // ============================================================
 
 #include <cstdio>
@@ -50,9 +51,20 @@
 #include "platform/fdt.cuh"
 
 // ============================================================
-// GPU Kernel — SMP execution
+// Host-GPU control structure (pinned memory, visible to both)
+// ============================================================
+struct HostGpuCtrl {
+    volatile uint32_t shutdown;              // host sets to 1 to stop all harts
+    volatile uint32_t hart_halted[MAX_HARTS]; // hart sets to 1 when permanently halted
+    volatile uint32_t fatal;                 // any hart sets to 1 on fatal error
+    volatile uint64_t instret[MAX_HARTS];    // exported for host progress reporting
+};
+
+// ============================================================
+// GPU Kernel — Persistent execution
 // Each block = one hart. blockIdx.x = hart ID.
 // Only thread 0 of each warp executes.
+// Kernel runs until shutdown or all harts halt.
 // ============================================================
 
 #define BATCH_SIZE 50000
@@ -66,8 +78,15 @@
     } \
 } while (0)
 
+// Spin helper: wait ~N nanoseconds using clock64()
+__device__ __forceinline__ void gpu_spin_ns(uint64_t ns, uint64_t gpu_freq) {
+    uint64_t cycles = ns * gpu_freq / 1000000000ULL;
+    uint64_t start = clock64();
+    while (clock64() - start < cycles) {}
+}
+
 __global__ void __launch_bounds__(32, 1)
-vcpu_run(HartState* harts, Machine* mach) {
+vcpu_run(HartState* harts, Machine* mach, HostGpuCtrl* ctrl) {
     const int hart_id = blockIdx.x;
     if (threadIdx.x != 0) return;
 
@@ -77,102 +96,148 @@ vcpu_run(HartState* harts, Machine* mach) {
     if (hart->gpu_clock_base == 0)
         hart->gpu_clock_base = clock64();
 
-    // Check HSM state — non-boot harts may be STOPPED
-    if (hart->hsm_status == HSM_STOPPED) {
-        hart->yield_reason = YIELD_WFI;
-        return;
-    }
-
-    // Hart just started — initialize execution state
-    if (hart->hsm_status == HSM_START_PENDING) {
-        hart->pc = hart->hsm_start_addr;
-        hart->x[10] = hart->mhartid;        // a0 = hartid
-        hart->x[11] = hart->hsm_start_arg;  // a1 = opaque
-        hart->priv = PRV_S;
-        hart->hsm_status = HSM_STARTED;
-        tlb_flush(hart->itlb);
-        tlb_flush(hart->dtlb);
-        icache_flush();
-        DPRINTF("[HART%d] Started at pc=%llx a0=%llu a1=%llx\n",
-                hart_id, (unsigned long long)hart->pc,
-                (unsigned long long)hart->mhartid,
-                (unsigned long long)hart->hsm_start_arg);
-    }
-
-    hart->yield_reason = YIELD_NONE;
-
     // Per-hart instruction cache
     ICacheEntry* ic_base = hart_icache();
 
-    for (int i = 0; i < BATCH_SIZE && hart->yield_reason == YIELD_NONE; i++) {
-        // Timer check
-        if ((i & 0x1FF) == 0) {
-            clint_tick(hart, mach->clint);
-            if (hart->stimecmp != 0 && hart->get_mtime() >= hart->stimecmp)
-                hart->mip |= MIP_STIP;
-            // UART → PLIC: set IRQ 10 if UART has pending interrupt
-            if (!(uart_compute_iir(mach->uart) & 0x01))
-                plic_set_pending(mach->plic, 10);
-            plic_update_ext(hart, mach->plic, hart_id);
+    // ---- Persistent event loop ----
+    while (!ctrl->shutdown) {
+
+        // HSM_STOPPED: spin-wait until started or shutdown
+        if (hart->hsm_status == HSM_STOPPED) {
+            // Use volatile to bypass L1 cache and see cross-SM writes
+            volatile HartStatus* hsm = &hart->hsm_status;
+            while (*hsm == HSM_STOPPED && !ctrl->shutdown)
+                gpu_spin_ns(1000, hart->gpu_clock_freq);  // ~1us spin
+            if (ctrl->shutdown) break;
         }
 
-        // Interrupt check
-        if ((i & 0xFF) == 0) {
-            if (hart->wfi) {
-                uint64_t pending = hart->mip & hart->mie;
-                if (pending) hart->wfi = 0;
-                else { hart->yield_reason = YIELD_WFI; break; }
+        // HSM_START_PENDING: initialize execution state
+        if (hart->hsm_status == HSM_START_PENDING) {
+            hart->pc = hart->hsm_start_addr;
+            hart->x[10] = hart->mhartid;
+            hart->x[11] = hart->hsm_start_arg;
+            hart->priv = PRV_S;
+            hart->hsm_status = HSM_STARTED;
+            tlb_flush(hart->itlb);
+            tlb_flush(hart->dtlb);
+            icache_flush();
+            DPRINTF("[HART%d] Started at pc=%llx a0=%llu a1=%llx\n",
+                    hart_id, (unsigned long long)hart->pc,
+                    (unsigned long long)hart->mhartid,
+                    (unsigned long long)hart->hsm_start_arg);
+        }
+
+        // ---- Execute a batch of instructions ----
+        hart->yield_reason = YIELD_NONE;
+
+        for (int i = 0; i < BATCH_SIZE && hart->yield_reason == YIELD_NONE; i++) {
+            // Timer + PLIC check
+            if ((i & 0x1FF) == 0) {
+                clint_tick(hart, mach->clint);
+                if (hart->stimecmp != UINT64_MAX && hart->get_mtime() >= hart->stimecmp)
+                    hart->mip |= MIP_STIP;
+                if (!(uart_compute_iir(mach->uart) & 0x01))
+                    plic_set_pending(mach->plic, 10);
+                plic_update_ext(hart, mach->plic, hart_id);
             }
-            check_interrupts(hart);
-        }
 
-        // Fetch with per-hart instruction cache
-        uint32_t insn;
-        int insn_len;
-        uint64_t pc = hart->pc;
-        uint32_t ic_idx = ((uint32_t)(pc >> 1)) & ICACHE_MASK;
-        ICacheEntry* ic = &ic_base[ic_idx];
-
-        if (ic->valid && ic->pc == pc) {
-            insn = ic->insn;
-            insn_len = ic->len;
-        } else {
-            uint32_t raw = 0;
-            if (!mem_fetch(hart, mach, &raw)) continue;
-
-            if ((raw & 3) != 3) {
-                insn = decompress_c((uint16_t)(raw & 0xFFFF));
-                insn_len = 2;
-                if (insn == 0) {
-                    take_trap(hart, EXC_ILLEGAL_INSN, hart->pc, raw & 0xFFFF);
-                    continue;
+            // Interrupt + WFI check
+            if ((i & 0xFF) == 0) {
+                if (hart->wfi) {
+                    uint64_t pending = hart->mip & hart->mie;
+                    if (pending) hart->wfi = 0;
+                    else break;  // exit inner loop, handle WFI in outer loop
                 }
-            } else {
-                insn = raw;
-                insn_len = 4;
+                check_interrupts(hart);
             }
 
-            ic->pc = pc;
-            ic->insn = insn;
-            ic->len = (uint8_t)insn_len;
-            ic->valid = 1;
+            // Fetch with icache
+            uint32_t insn;
+            int insn_len;
+            uint64_t pc = hart->pc;
+            uint32_t ic_idx = ((uint32_t)(pc >> 1)) & ICACHE_MASK;
+            ICacheEntry* ic = &ic_base[ic_idx];
+
+            if (ic->valid && ic->pc == pc) {
+                insn = ic->insn;
+                insn_len = ic->len;
+            } else {
+                uint32_t raw = 0;
+                if (!mem_fetch(hart, mach, &raw)) continue;
+
+                if ((raw & 3) != 3) {
+                    insn = decompress_c((uint16_t)(raw & 0xFFFF));
+                    insn_len = 2;
+                    if (insn == 0) {
+                        take_trap(hart, EXC_ILLEGAL_INSN, hart->pc, raw & 0xFFFF);
+                        continue;
+                    }
+                } else {
+                    insn = raw;
+                    insn_len = 4;
+                }
+
+                ic->pc = pc;
+                ic->insn = insn;
+                ic->len = (uint8_t)insn_len;
+                ic->valid = 1;
+            }
+
+            // Execute
+            bool pc_written = execute(hart, mach, insn, insn_len);
+            if (!pc_written)
+                hart->pc += insn_len;
+
+            hart->x[0] = 0;
+            hart->instret++;
         }
 
-        // Execute
-        bool pc_written = execute(hart, mach, insn, insn_len);
-        if (!pc_written)
-            hart->pc += insn_len;
+        // Export instret to pinned memory for host progress reporting
+        ctrl->instret[hart_id] = hart->instret;
 
-        hart->x[0] = 0;
-        hart->instret++;
+        // ---- Handle WFI inline: spin-wait until interrupt pending ----
+        if (hart->wfi) {
+            while (hart->wfi && !ctrl->shutdown) {
+                // clock64() keeps ticking — mtime advances naturally
+                clint_tick(hart, mach->clint);
+                if (hart->stimecmp != UINT64_MAX && hart->get_mtime() >= hart->stimecmp)
+                    hart->mip |= MIP_STIP;
+                // Check UART RX → PLIC
+                if (!(uart_compute_iir(mach->uart) & 0x01))
+                    plic_set_pending(mach->plic, 10);
+                plic_update_ext(hart, mach->plic, hart_id);
+
+                uint64_t pending = hart->mip & hart->mie;
+                if (pending) { hart->wfi = 0; break; }
+
+                // Throttle spin to avoid hammering memory bus (~10us)
+                gpu_spin_ns(10000, hart->gpu_clock_freq);
+            }
+            continue;  // resume execution
+        }
+
+        // ---- Handle halt/fatal ----
+        if (hart->yield_reason == YIELD_HALT) {
+            ctrl->hart_halted[hart_id] = 1;
+            __threadfence_system();
+            // Park: spin until shutdown
+            while (!ctrl->shutdown)
+                gpu_spin_ns(100000, hart->gpu_clock_freq);  // 100us
+            break;
+        }
+        if (hart->yield_reason == YIELD_FATAL) {
+            ctrl->fatal = 1;
+            __threadfence_system();
+            break;
+        }
+
+        // YIELD_UART_TX / YIELD_BATCH_END: just continue
+        hart->yield_reason = YIELD_NONE;
     }
-
-    if (hart->yield_reason == YIELD_NONE)
-        hart->yield_reason = YIELD_BATCH_END;
 }
 
 // ============================================================
-// Host: SMP setup and main loop
+// Host: SMP setup and polling loop
 // ============================================================
 
 static void init_hart(HartState* h, int hartid, uint64_t entry_pc,
@@ -193,8 +258,8 @@ static void init_hart(HartState* h, int hartid, uint64_t entry_pc,
 
     h->gpu_clock_freq = gpu_freq;
     h->stimecmp = UINT64_MAX;
-    h->mcounteren = 7;  // CY, TM, IR: allow S-mode counter access
-    h->scounteren = 7;  // Allow U-mode counter access
+    h->mcounteren = 7;
+    h->scounteren = 7;
 
     for (int i = 0; i < TLB_SIZE; i++) {
         h->itlb[i].valid = 0;
@@ -204,8 +269,8 @@ static void init_hart(HartState* h, int hartid, uint64_t entry_pc,
     if (is_boot_hart) {
         h->pc = entry_pc;
         h->priv = PRV_S;
-        h->x[10] = hartid;   // a0 = hartid
-        h->x[11] = dtb_addr; // a1 = dtb address
+        h->x[10] = hartid;
+        h->x[11] = dtb_addr;
         h->hsm_status = HSM_STARTED;
     } else {
         h->pc = 0;
@@ -219,7 +284,6 @@ static void set_nonblocking_stdin() {
     fcntl(STDIN_FILENO, F_SETFL, flags | O_NONBLOCK);
 }
 
-// Terminal restore on abnormal exit
 static struct termios g_old_term;
 static bool g_term_modified = false;
 
@@ -292,15 +356,14 @@ int main(int argc, char** argv) {
     CUDA_CHECK(cudaMemcpy(d_dram + kernel_offset, kernel_data, kernel_size, cudaMemcpyHostToDevice));
     uint64_t entry_pc = DRAM_BASE + kernel_offset;
 
-    // Build FDT with N CPUs
-    uint8_t* fdt_buf = (uint8_t*)calloc(1, 65536);  // large enough for many CPUs
+    // Build FDT
+    uint8_t* fdt_buf = (uint8_t*)calloc(1, 65536);
     const char* bootargs = "earlycon=uart8250,mmio,0x10000000,115200 console=ttyS0 norandmaps";
     int fdt_size = build_fdt(fdt_buf, DRAM_BASE, dram_size, bootargs, num_harts);
 
     uint64_t dtb_offset = dram_size - 0x200000;
     if ((uint64_t)kernel_size > dtb_offset) {
-        fprintf(stderr, "[GLAE] ERROR: kernel (%ld bytes) overlaps FDT at offset 0x%llx\n",
-                kernel_size, (unsigned long long)dtb_offset);
+        fprintf(stderr, "[GLAE] ERROR: kernel (%ld bytes) overlaps FDT\n", kernel_size);
         free(fdt_buf); free(kernel_data);
         return 1;
     }
@@ -311,13 +374,18 @@ int main(int argc, char** argv) {
     if (debug) printf("[GLAE] FDT: %d bytes at 0x%llx (%d CPUs)\n",
                       fdt_size, (unsigned long long)dtb_addr, num_harts);
 
-    // Allocate ring buffers
+    // Allocate ring buffers (pinned memory — shared between host and GPU)
     Ring* tx_ring;
     Ring* rx_ring;
     CUDA_CHECK(cudaMallocHost(&tx_ring, sizeof(Ring)));
     CUDA_CHECK(cudaMallocHost(&rx_ring, sizeof(Ring)));
     memset(tx_ring, 0, sizeof(Ring));
     memset(rx_ring, 0, sizeof(Ring));
+
+    // Allocate host-GPU control (pinned memory)
+    HostGpuCtrl* ctrl;
+    CUDA_CHECK(cudaMallocHost(&ctrl, sizeof(HostGpuCtrl)));
+    memset((void*)ctrl, 0, sizeof(HostGpuCtrl));
 
     // Allocate devices
     Uart* d_uart;
@@ -341,7 +409,7 @@ int main(int argc, char** argv) {
     CUDA_CHECK(cudaMalloc(&d_plic, sizeof(Plic)));
     CUDA_CHECK(cudaMemset(d_plic, 0, sizeof(Plic)));
 
-    // Allocate N hart states
+    // Allocate hart states
     HartState* d_harts;
     CUDA_CHECK(cudaMalloc(&d_harts, num_harts * sizeof(HartState)));
     {
@@ -371,7 +439,7 @@ int main(int argc, char** argv) {
 
     CUDA_CHECK(cudaDeviceSynchronize());
 
-    if (debug) printf("[GLAE] Starting execution (%d harts)...\n\n", num_harts);
+    if (debug) printf("[GLAE] Starting persistent kernel (%d harts)...\n\n", num_harts);
 
     set_nonblocking_stdin();
     tcgetattr(STDIN_FILENO, &g_old_term);
@@ -384,25 +452,20 @@ int main(int argc, char** argv) {
     signal(SIGTERM, signal_handler);
 
     auto t_start = std::chrono::high_resolution_clock::now();
-    uint64_t total_batches = 0;
+    auto t_last_report = t_start;
+
+    // ---- Launch kernel ONCE — it runs until shutdown ----
+    vcpu_run<<<num_harts, 32>>>(d_harts, d_mach, ctrl);
+
+    // ---- Host polling loop (no cudaDeviceSynchronize) ----
     bool running = true;
-
     while (running) {
-        // Launch one block per hart, 32 threads per block
-        vcpu_run<<<num_harts, 32>>>(d_harts, d_mach);
-        cudaError_t err = cudaDeviceSynchronize();
-        if (err != cudaSuccess) {
-            fprintf(stderr, "[GLAE] CUDA error: %s\n", cudaGetErrorString(err));
-            break;
-        }
-        total_batches++;
-
-        // Drain UART TX
+        // 1. Drain UART TX ring
         uint8_t ch;
         while (ring_pop(tx_ring, &ch)) putchar(ch);
         fflush(stdout);
 
-        // Feed UART RX
+        // 2. Feed UART RX ring
         char inbuf[16];
         int n = read(STDIN_FILENO, inbuf, sizeof(inbuf));
         if (n > 0) {
@@ -410,68 +473,45 @@ int main(int argc, char** argv) {
                 ring_push(rx_ring, (uint8_t)inbuf[i]);
         }
 
-        // Check if ALL harts are halted
+        // 3. Check for fatal error (pinned memory — no cudaMemcpy!)
+        if (ctrl->fatal) {
+            running = false;
+            break;
+        }
+
+        // 4. Check if all harts permanently halted
         bool all_halted = true;
         for (int h = 0; h < num_harts; h++) {
-            uint32_t yield;
-            cudaMemcpy(&yield, &d_harts[h].yield_reason, sizeof(uint32_t), cudaMemcpyDeviceToHost);
-            if (yield == YIELD_FATAL) { running = false; break; }
-            if (yield != YIELD_HALT && yield != YIELD_WFI) all_halted = false;
+            if (!ctrl->hart_halted[h]) { all_halted = false; break; }
         }
-
-        // Check if any STOPPED hart has been START_PENDING'd
-        // (no action needed — the kernel handles it on next launch)
-
-        // If all harts are WFI/halted, brief sleep
         if (all_halted) {
-            // Check if any hart can be woken
-            bool any_wfi = false;
-            for (int h = 0; h < num_harts; h++) {
-                uint32_t yield;
-                cudaMemcpy(&yield, &d_harts[h].yield_reason, sizeof(uint32_t), cudaMemcpyDeviceToHost);
-                if (yield == YIELD_WFI) any_wfi = true;
-                if (yield == YIELD_HALT) {
-                    HartStatus status;
-                    cudaMemcpy(&status, &d_harts[h].hsm_status, sizeof(HartStatus), cudaMemcpyDeviceToHost);
-                    if (status == HSM_START_PENDING) any_wfi = true; // will start next batch
-                }
-            }
-            if (any_wfi) {
-                usleep(1000);
-                // Advance guest time for WFI harts: clock64() doesn't tick while
-                // the GPU kernel isn't running, so subtract from gpu_clock_base
-                // to simulate 1ms of elapsed time per sleep cycle.
-                uint64_t advance = gpu_freq / 1000;  // 1ms worth of GPU cycles
-                for (int h = 0; h < num_harts; h++) {
-                    uint32_t yield;
-                    cudaMemcpy(&yield, &d_harts[h].yield_reason, sizeof(uint32_t), cudaMemcpyDeviceToHost);
-                    if (yield == YIELD_WFI) {
-                        uint64_t base;
-                        cudaMemcpy(&base, &d_harts[h].gpu_clock_base, sizeof(uint64_t), cudaMemcpyDeviceToHost);
-                        base -= advance;
-                        cudaMemcpy(&d_harts[h].gpu_clock_base, &base, sizeof(uint64_t), cudaMemcpyHostToDevice);
-                    }
-                }
-            }
-            else { running = false; }  // all halted permanently
+            running = false;
+            break;
         }
 
-        // Progress report
-        if (debug && (total_batches % 2000 == 0)) {
-            uint64_t total_insns = 0;
-            for (int h = 0; h < num_harts; h++) {
-                uint64_t instret;
-                cudaMemcpy(&instret, &d_harts[h].instret, sizeof(uint64_t), cudaMemcpyDeviceToHost);
-                total_insns += instret;
-            }
+        // 5. Progress report (every ~2 seconds)
+        if (debug) {
             auto now = std::chrono::high_resolution_clock::now();
-            double elapsed = std::chrono::duration<double>(now - t_start).count();
-            fprintf(stderr, "[GLAE] batch=%llu total_insns=%llu MIPS=%.1f (%.1fs) harts=%d\n",
-                    (unsigned long long)total_batches,
-                    (unsigned long long)total_insns,
-                    total_insns / elapsed / 1e6, elapsed, num_harts);
+            double since_report = std::chrono::duration<double>(now - t_last_report).count();
+            if (since_report >= 2.0) {
+                t_last_report = now;
+                uint64_t total_insns = 0;
+                for (int h = 0; h < num_harts; h++)
+                    total_insns += ctrl->instret[h];
+                double elapsed = std::chrono::duration<double>(now - t_start).count();
+                fprintf(stderr, "[GLAE] insns=%llu MIPS=%.1f (%.1fs) harts=%d\n",
+                        (unsigned long long)total_insns,
+                        total_insns / elapsed / 1e6, elapsed, num_harts);
+            }
         }
+
+        // 6. Brief yield — 100us polling interval
+        usleep(100);
     }
+
+    // Signal kernel to shut down and wait for all blocks to exit
+    ctrl->shutdown = 1;
+    cudaDeviceSynchronize();
 
     auto t_end = std::chrono::high_resolution_clock::now();
     double elapsed = std::chrono::duration<double>(t_end - t_start).count();
@@ -492,6 +532,7 @@ int main(int argc, char** argv) {
     restore_terminal();
     cudaFreeHost(tx_ring);
     cudaFreeHost(rx_ring);
+    cudaFreeHost(ctrl);
     cudaFree(d_harts);
     cudaFree(d_mach);
     cudaFree(d_uart);

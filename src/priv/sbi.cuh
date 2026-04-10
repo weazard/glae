@@ -52,8 +52,6 @@ __device__ bool handle_sbi(HartState* hart, Machine* m) {
 
     case SBI_LEGACY_CONSOLE_PUTCHAR:
         ring_push(m->uart->tx_ring, (uint8_t)a0);
-        if (ring_count(m->uart->tx_ring) > RING_SIZE * 3 / 4)
-            hart->yield_reason = YIELD_UART_TX;
         hart->x[10] = 0;
         return true;
 
@@ -151,6 +149,7 @@ __device__ bool handle_sbi(HartState* hart, Machine* m) {
                     target->hsm_start_addr = start_addr;
                     target->hsm_start_arg = opaque;
                     target->hsm_status = HSM_START_PENDING;
+                    __threadfence_system();  // ensure visibility across SMs
                     DPRINTF("[HSM] hart%llu starting hart%llu at %llx\n",
                             (unsigned long long)my_id,
                             (unsigned long long)target_id,
